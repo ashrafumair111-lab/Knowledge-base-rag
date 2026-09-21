@@ -1,0 +1,22 @@
+# --- Secrets (kabhi commit na karein) ---
+.env
+.env.*
+*.env
+
+# --- Python / uv ---
+.venv/
+venv/
+__pycache__/
+*.py[oc]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+

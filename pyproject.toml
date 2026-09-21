@@ -1,0 +1,22 @@
+[project]
+name = "rag-python"
+version = "1.0.0"
+description = "RAG AI assistant (FastAPI) - semantic search only"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cohere>=5.21.1",
+    "fastapi>=0.141.1",
+    "langchain-cohere>=0.6.0",
+    "langchain-groq>=1.1.3",
+    "langchain-qdrant>=1.1.0",
+    "langchain-text-splitters>=1.1.2",
+    "pypdf>=6.19.0",
+    "python-dotenv>=1.2.3",
+    "uvicorn[standard]>=0.53.0",
+]
+
+# Ye ek script-style project hai (src layout nahi), isliye uv isko
+# package ke tor par build/install nahi karega - sirf dependencies install karega.
+[tool.uv]
+package = false
