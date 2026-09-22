@@ -13,6 +13,7 @@ The pipeline is identical, with one deliberate simplification:
 
 - [What it does](#what-it-does)
 - [Pipeline](#pipeline)
+- [Ingestion behaviour](#ingestion-behaviour)
 - [Technology stack](#technology-stack)
 - [Requirements](#requirements)
 - [Setup](#setup)
@@ -27,10 +28,11 @@ The pipeline is identical, with one deliberate simplification:
 
 ## What it does
 
-1. **On startup** the service reads `knowledge.pdf`, splits it into overlapping text chunks,
-   embeds those chunks with Cohere, and stores the vectors in a Qdrant collection.
-2. **On every request** to `POST /api` it embeds the question, retrieves the 20 most
-   semantically similar chunks, re-ranks them with Cohere, and keeps the best 5.
+1. **On the first request** to `POST /api`, the service reads `knowledge.pdf`, splits it into
+   overlapping text chunks, embeds them with Cohere, and **overwrites** the vectors held in
+   the Qdrant collection. Later requests in the same process skip this step entirely.
+2. **On every request** it embeds the question, retrieves the 20 most semantically similar
+   chunks, re-ranks them with Cohere, and keeps the best 5.
 3. A Groq-hosted LLM generates the final answer using **only** that retrieved context.
    If the answer is not present in the document, it replies:
    `I don't know from uploaded PDF.`
@@ -40,14 +42,16 @@ The pipeline is identical, with one deliberate simplification:
 ## Pipeline
 
 ```
-STARTUP (once, before the server accepts requests)
+FIRST POST /api CALL OF EACH PROCESS (runs once, then never again)
   knowledge.pdf
       -> pypdf                          extract plain text
       -> RecursiveCharacterTextSplitter chunk_size=1000, chunk_overlap=200
+      -> deterministic ids              uuid5(PDF_NAMESPACE, source + chunk text)
+      -> Qdrant DELETE                  remove this document's existing chunks
       -> Cohere embed-english-v3.0      embed each chunk
-      -> Qdrant "grocery store"         store vectors (cosine, 1024-dim)
+      -> Qdrant upsert                  insert fresh chunks => always exactly 7 points
 
-REQUEST (per POST /api call)
+EVERY POST /api CALL
   question
       -> Cohere embed-english-v3.0      embed the query
       -> Qdrant similarity_search(k=20) semantic / dense retrieval
@@ -82,7 +86,8 @@ REQUEST (per POST /api call)
 - **uv** — it will download and manage Python 3.12 automatically.
 - A **Cohere** API key (used for embeddings and re-ranking).
 - A **Groq** API key (used for answer generation).
-- A **Qdrant** instance (URL and API key). The target collection must already exist.
+- A **Qdrant** instance (URL and API key). The collection is created automatically if it
+  does not exist, together with the payload index needed for filtering.
 
 ---
 
@@ -233,7 +238,9 @@ The tunable values are currently hard-coded in `main.py`:
 | Chunk size / overlap | 1000 / 200 | `upload()` |
 | Candidate chunks retrieved | 20 | `similarity_search(..., k=20)` |
 | Chunks passed to the LLM | 5 | `rerank(..., top_n=5)` |
-| Collection name | `grocery store` | `from_existing_collection(...)` |
+| Collection name | `grocery store` | `COLLECTION_NAME` |
+| Source document | `./knowledge.pdf` | `PDF_PATH` |
+| Point id namespace | fixed UUID | `PDF_NAMESPACE` - must never change |
 | LLM model | `openai/gpt-oss-120b` | `ChatGroq(...)` |
 
 ---
@@ -242,28 +249,52 @@ The tunable values are currently hard-coded in `main.py`:
 
 1. FastAPI validates the JSON body against the `AskRequest` model; a missing `input`
    field returns `422 Unprocessable Entity` automatically.
-2. The question is embedded with Cohere `embed-english-v3.0`.
-3. Qdrant returns the 20 chunks with the highest cosine similarity.
-4. Cohere `rerank-english-v3.0` re-scores those chunks and the best 5 are kept.
-5. The 5 chunks are concatenated into a single context string.
-6. The system prompt instructs the model to answer **only** from that context, and to
+2. `ensure_ingested()` performs the overwrite described in
+   [Ingestion behaviour](#ingestion-behaviour) - only on the first request in a process.
+3. The question is embedded with Cohere `embed-english-v3.0`.
+4. Qdrant returns the 20 chunks with the highest cosine similarity.
+5. Cohere `rerank-english-v3.0` re-scores those chunks and the best 5 are kept.
+6. The 5 chunks are concatenated into a single context string.
+7. The system prompt instructs the model to answer **only** from that context, and to
    reply `I don't know from uploaded PDF.` when the answer is absent.
-7. The answer is returned as `{ "content": "..." }`.
+8. The answer is returned as `{ "content": "..." }`.
+
+---
+
+## Ingestion behaviour
+
+Ingestion is **lazy** and **idempotent**:
+
+- It runs on the **first `POST /api` call of each process** - never on startup. Later calls
+  in the same process do nothing (`ensure_ingested()` short-circuits on a flag).
+- It **overwrites** instead of appending. Before inserting, this document's previous chunks
+  are deleted:
+  1. by point id (deterministic content ids), and
+  2. by a payload filter on `metadata.source`, which also catches chunks whose text changed.
+- Point ids are `uuid5(PDF_NAMESPACE, f"{PDF_PATH}::{chunk_text}")`, so the same chunk always
+  maps to the same id and the insert behaves as an **upsert**.
+- The collection therefore always holds exactly **7 points**, no matter how often the server
+  restarts.
+
+> **Warning:** `PDF_NAMESPACE` must never change. If it does, previously stored points stop
+> matching the id-based delete and duplicates will accumulate. (The `source` filter would
+> still catch them, provided they carry `metadata.source`.)
 
 ---
 
 ## Notes and limitations
 
-1. **Re-ingestion on every start.** `upload()` runs inside the FastAPI lifespan, so every
-   start appends another copy of each chunk to the collection. This matches the original
-   Node.js behaviour, but repeated restarts accumulate duplicates and can degrade
-   retrieval quality. To prevent it, remove the `upload()` call from `lifespan` after the
-   document has been ingested, or guard it with a collection-size check.
-2. **The collection must already exist.** It is not created on demand.
+1. **Every restart rewrites the vectors once.** Because ingestion overwrites, the first
+   `/api` call after each start re-embeds the 7 chunks (~2-4 seconds plus a small Cohere
+   cost). That rewrite is what guarantees no duplicates. To skip it when the PDF is
+   unchanged, compare a `sha256` of the file before calling `upload()`.
+2. **The collection must not be shared between documents.** The `source` filter deletes by
+   document. If you add a second PDF, ingest it with its own `PDF_PATH`/source value so one
+   document's overwrite never removes another's chunks.
 3. **No authentication.** `POST /api` is open — do not expose the service publicly as-is.
 4. **English-only embedding model.** `embed-english-v3.0` is not suitable for
    non-English documents.
-5. **Single document.** The service always ingests `knowledge.pdf` from the working
-   directory, so it must be started from the project root.
+5. **Single document.** `PDF_PATH` points at `./knowledge.pdf`, so the service must be
+   started from the project root.
 6. **No custom retry or timeout policy** beyond each SDK's defaults.
 
