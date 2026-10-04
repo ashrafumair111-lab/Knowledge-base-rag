@@ -117,7 +117,7 @@ QDRANT_URL=https://your-cluster.region.aws.cloud.qdrant.io
 QDRANT_API_KEY=your_qdrant_api_key
 ```
 
-### 3. Install dependencies
+### 3. Install  dependencies
 
 ```powershell
 uv sync
