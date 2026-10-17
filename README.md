@@ -28,14 +28,19 @@ The pipeline is identical, with one deliberate simplification:
 
 ## What it does
 
-1. **On the first request** to `POST /api`, the service reads `knowledge.pdf`, splits it into
-   overlapping text chunks, embeds them with Cohere, and **overwrites** the vectors held in
-   the Qdrant collection. Later requests in the same process skip this step entirely.
-2. **On every request** it embeds the question, retrieves the 20 most semantically similar
-   chunks, re-ranks them with Cohere, and keeps the best 5.
+1. **On upload** (`POST /upload` from the web UI or curl), the service reads the file
+   (PDF / TXT / MD), splits it into overlapping text chunks, embeds them with Cohere, and
+   stores them in the Qdrant collection. Uploading is **idempotent**:
+   - Same file again (same name + same sha256) → **skipped**, nothing is re-embedded.
+   - Same file name, new content → old chunks are **overwritten** (deleted + re-inserted).
+2. **On every question** it embeds the query, retrieves the 20 most semantically similar
+   chunks across **all** uploaded files, re-ranks them with Cohere, and keeps the best 5.
 3. A Groq-hosted LLM generates the final answer using **only** that retrieved context.
-   If the answer is not present in the document, it replies:
+   If the answer is not present in the documents, it replies:
    `I don't know from uploaded PDF.`
+
+A simple **web UI** (Jinja2 + vanilla HTML/CSS/JS) is served at `GET /` — chat with the
+knowledge base and upload files from the browser.
 
 ---
 
@@ -143,8 +148,9 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:3000 (Press CTRL+C to quit)
 ```
 
-`Application startup complete.` confirms that the PDF was read, chunked and stored
-successfully. The first start after a fresh install can take around 30 seconds while
+`Application startup complete.` confirms the server is ready. Open
+**http://localhost:3000** in a browser for the chat UI (upload a file, then ask questions).
+The first start after a fresh install can take around 30 seconds while
 Windows scans the newly installed binaries; subsequent starts take roughly 10 seconds.
 
 ### Option B — development mode (auto-reload)
@@ -163,6 +169,30 @@ Press `CTRL+C` in the terminal.
 ---
 
 ## API reference
+
+### `GET /`
+
+Serves the web UI (Jinja2 chat page with file upload and message input).
+
+### `POST /upload`
+
+Uploads a file (PDF, TXT or MD) and ingests it into Qdrant.
+
+- **Same file uploaded again** (same name + same sha256) → `"skipped"`, no re-embedding.
+- **Same name, new content** → `"overwritten"` (old chunks deleted, new ones inserted).
+- **New file** → `"ingested"`.
+
+**Response — `200 OK`**
+
+```json
+{ "status": "ingested", "source": "knowledge.pdf", "chunks": 7, "sha256": "9c1c..." }
+```
+
+**Example — curl**
+
+```bash
+curl -X POST http://localhost:3000/upload -F "file=@./knowledge.pdf"
+```
 
 ### `POST /api`
 
@@ -211,9 +241,13 @@ knowledge base rag/
 ├── .env                 # secrets - git-ignored, never commit
 ├── .gitignore
 ├── .python-version      # pins Python 3.12
-├── knowledge.pdf        # the document that gets ingested
+├── knowledge.pdf        # sample document (upload more via the UI)
+├── ingested.json        # runtime registry: filename -> sha256 + chunk count
 ├── main.py              # the entire application
 ├── pyproject.toml       # dependency declarations
+├── static/              # CSS + JS for the web UI
+├── templates/           # Jinja2 template (index.html)
+├── uploads/             # files uploaded through the UI (runtime)
 ├── uv.lock              # locked dependency versions
 └── README.md
 ```
@@ -235,11 +269,12 @@ The tunable values are currently hard-coded in `main.py`:
 
 | Setting | Value | Where |
 |---|---|---|
-| Chunk size / overlap | 1000 / 200 | `upload()` |
+| Chunk size / overlap | 1000 / 200 | `ingest_file()` |
 | Candidate chunks retrieved | 20 | `similarity_search(..., k=20)` |
 | Chunks passed to the LLM | 5 | `rerank(..., top_n=5)` |
 | Collection name | `grocery store` | `COLLECTION_NAME` |
-| Source document | `./knowledge.pdf` | `PDF_PATH` |
+| Accepted file types | `.pdf`, `.txt`, `.md`, `.markdown` | `ALLOWED_EXTENSIONS` |
+| Duplicate detection | sha256 per filename | `ingested.json` registry |
 | Point id namespace | fixed UUID | `PDF_NAMESPACE` - must never change |
 | LLM model | `openai/gpt-oss-120b` | `ChatGroq(...)` |
 
@@ -249,9 +284,7 @@ The tunable values are currently hard-coded in `main.py`:
 
 1. FastAPI validates the JSON body against the `AskRequest` model; a missing `input`
    field returns `422 Unprocessable Entity` automatically.
-2. `ensure_ingested()` performs the overwrite described in
-   [Ingestion behaviour](#ingestion-behaviour) - only on the first request in a process.
-3. The question is embedded with Cohere `embed-english-v3.0`.
+2. The question is embedded with Cohere `embed-english-v3.0`.
 4. Qdrant returns the 20 chunks with the highest cosine similarity.
 5. Cohere `rerank-english-v3.0` re-scores those chunks and the best 5 are kept.
 6. The 5 chunks are concatenated into a single context string.
@@ -263,18 +296,18 @@ The tunable values are currently hard-coded in `main.py`:
 
 ## Ingestion behaviour
 
-Ingestion is **lazy** and **idempotent**:
+Ingestion is **explicit** (upload-driven) and **idempotent**:
 
-- It runs on the **first `POST /api` call of each process** - never on startup. Later calls
-  in the same process do nothing (`ensure_ingested()` short-circuits on a flag).
-- It **overwrites** instead of appending. Before inserting, this document's previous chunks
-  are deleted:
-  1. by point id (deterministic content ids), and
-  2. by a payload filter on `metadata.source`, which also catches chunks whose text changed.
-- Point ids are `uuid5(PDF_NAMESPACE, f"{PDF_PATH}::{chunk_text}")`, so the same chunk always
+- It runs only on `POST /upload` - never on startup, never on `/api` calls.
+- Every upload is hashed (`sha256`) and recorded in `ingested.json` (filename -> hash):
+  - **Same filename + same hash** (and chunks still present in Qdrant) → **skipped**
+    entirely: no re-embedding, no API cost, no duplicates.
+  - **Same filename + new hash** → **overwrite**: the file's previous chunks are deleted
+    (by point id and by a `metadata.source` payload filter), then fresh chunks are inserted.
+  - **New filename** → chunks are inserted as a new source; other documents are untouched.
+- Point ids are `uuid5(PDF_NAMESPACE, f"{source}::{chunk_text}")`, so the same chunk always
   maps to the same id and the insert behaves as an **upsert**.
-- The collection therefore always holds exactly **7 points**, no matter how often the server
-  restarts.
+- Chat retrieval searches **all** uploaded sources in the collection at once.
 
 > **Warning:** `PDF_NAMESPACE` must never change. If it does, previously stored points stop
 > matching the id-based delete and duplicates will accumulate. (The `source` filter would
@@ -284,17 +317,16 @@ Ingestion is **lazy** and **idempotent**:
 
 ## Notes and limitations
 
-1. **Every restart rewrites the vectors once.** Because ingestion overwrites, the first
-   `/api` call after each start re-embeds the 7 chunks (~2-4 seconds plus a small Cohere
-   cost). That rewrite is what guarantees no duplicates. To skip it when the PDF is
-   unchanged, compare a `sha256` of the file before calling `upload()`.
-2. **The collection must not be shared between documents.** The `source` filter deletes by
-   document. If you add a second PDF, ingest it with its own `PDF_PATH`/source value so one
-   document's overwrite never removes another's chunks.
-3. **No authentication.** `POST /api` is open — do not expose the service publicly as-is.
+1. **Deleting `ingested.json` forces re-embedding.** The registry is what makes identical
+   re-uploads skip. If it is lost, re-uploading the same file re-embeds it once; the
+   overwrite logic still prevents duplicates.
+2. **Each file overwrites only itself.** Deletion is scoped by `metadata.source` (the
+   filename), so one document's overwrite never removes another's chunks.
+3. **No authentication.** `/api` and `/upload` are open — do not expose the service
+   publicly as-is.
 4. **English-only embedding model.** `embed-english-v3.0` is not suitable for
    non-English documents.
-5. **Single document.** `PDF_PATH` points at `./knowledge.pdf`, so the service must be
-   started from the project root.
+5. **PDF, TXT and MD only.** Other file types are rejected with `400 Bad Request`.
+   Uploaded files are stored under `uploads/`.
 6. **No custom retry or timeout policy** beyond each SDK's defaults.
 

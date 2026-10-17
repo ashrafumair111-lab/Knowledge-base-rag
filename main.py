@@ -1,11 +1,16 @@
+import hashlib
+import json
 import os
 import threading
 import uuid
+from pathlib import Path
 
 import cohere
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from langchain_cohere import CohereEmbeddings
 from langchain_groq import ChatGroq
 from langchain_qdrant import QdrantVectorStore
@@ -13,11 +18,18 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
+from starlette.requests import Request
 
 load_dotenv()
 
 COLLECTION_NAME = "grocery store"
-PDF_PATH = "./knowledge.pdf"
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+REGISTRY_PATH = BASE_DIR / "ingested.json"
+
+# Sirf yehi file types accept hote hain (pypdf / plain text)
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
 
 # Fixed namespace: har chunk ka point ID uske text se banaya jata hai, isliye
 # same chunk ka ID hamesha same rehta hai -> overwrite (upsert) reliable hota hai.
@@ -70,26 +82,88 @@ vector_store = QdrantVectorStore(
 )
 
 
-def upload() -> dict:
-    """PDF padho -> chunks banao -> purane chunks DELETE -> naye chunks INSERT (overwrite)."""
-    reader = PdfReader(PDF_PATH)
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-    )
+# Upload registry lock - ek saath do uploads par registry/overwrite race na ho
+registry_lock = threading.Lock()
 
-    # metadata.source isliye ke is se is PDF ke purane chunks dhoondh kar delete kar saken
-    docs = splitter.create_documents([text], metadatas=[{"source": PDF_PATH}])
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def registry_load() -> dict:
+    """ingested.json padho (source -> sha256 + chunks). Corrupt ho to fresh start."""
+    if REGISTRY_PATH.exists():
+        try:
+            return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def extract_text(path: Path) -> str:
+    """PDF se text nikaalo (pypdf) ya TXT/MD ko seedha padho."""
+    if path.suffix.lower() == ".pdf":
+        reader = PdfReader(str(path))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def source_chunk_count(source: str) -> int:
+    """Qdrant mein is source ke kitne chunks abhi maujood hain."""
+    return qdrant.count(
+        collection_name=COLLECTION_NAME,
+        count_filter=models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="metadata.source",
+                    match=models.MatchValue(value=source),
+                )
+            ]
+        ),
+    ).count
+
+
+def ingest_file(path: Path, file_hash: str) -> dict:
+    """File padho -> chunks banao -> SKIP ya OVERWRITE decide karo.
+
+    - Agar yehi file (name + sha256) pehle se Qdrant mein hai -> SKIP (koi kaam nahi)
+    - Agar naam same lekin content naya -> OVERWRITE (purane chunks delete, naye insert)
+    - Bilkul naya file -> ingest
+    """
+    source = path.name
+    registry = registry_load()
+
+    # --- SKIP: same file already in Qdrant -> dobara embed mat karo ---
+    if registry.get(source, {}).get("sha256") == file_hash and source_chunk_count(source) > 0:
+        return {
+            "status": "skipped",
+            "source": source,
+            "chunks": registry[source].get("chunks", 0),
+            "sha256": file_hash,
+        }
+
+    text = extract_text(path)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail=f"No extractable text found in {source}")
+
+    # metadata.source isliye ke is se is file ke purane chunks dhoondh kar delete kar saken
+    docs = splitter.create_documents([text], metadatas=[{"source": source}])
 
     # Har chunk ka point ID uske text se banaya (deterministic -> upsert reliable)
     ids = [
-        str(uuid.uuid5(PDF_NAMESPACE, f"{PDF_PATH}::{doc.page_content}"))
+        str(uuid.uuid5(PDF_NAMESPACE, f"{source}::{doc.page_content}"))
         for doc in docs
     ]
 
-    # --- OVERWRITE: pehle is PDF ke purane chunks Qdrant se hatao ---
+    status = "overwritten" if source in registry else "ingested"
+
+    # --- OVERWRITE: pehle is file ke purane chunks Qdrant se hatao ---
+    # (legacy "./naam" source bhi saaf hota hai - purane fixed-PDF wale ingest ke liye)
     qdrant.delete(collection_name=COLLECTION_NAME, points_selector=ids)
     qdrant.delete(
         collection_name=COLLECTION_NAME,
@@ -97,7 +171,7 @@ def upload() -> dict:
             must=[
                 models.FieldCondition(
                     key="metadata.source",
-                    match=models.MatchValue(value=PDF_PATH),
+                    match=models.MatchAny(any=[source, f"./{source}"]),
                 )
             ]
         ),
@@ -106,46 +180,59 @@ def upload() -> dict:
     # --- phir fresh chunks daalo (ids dene se ye upsert ban jata hai) ---
     vector_store.add_documents(docs, ids=ids)
 
-    return {"status": "overwritten", "chunks": len(docs), "source": PDF_PATH}
+    registry[source] = {"sha256": file_hash, "chunks": len(docs)}
+    REGISTRY_PATH.write_text(json.dumps(registry, indent=2), encoding="utf-8")
 
-
-_ingest_state = {"done": False}
-_ingest_lock = threading.Lock()
-
-
-def ensure_ingested() -> None:
-    """Sirf process ke PEHLE /api call par knowledge.pdf load/overwrite karta hai.
-
-    Uske baad ki calls no-op hain. Agar upload fail ho jaye to flag False rehta hai,
-    isliye agli call par dobara koshish hoti hai.
-    """
-    if _ingest_state["done"]:
-        return
-
-    with _ingest_lock:
-        if _ingest_state["done"]:
-            return
-
-        print(f"[ingest] {upload()}")
-        _ingest_state["done"] = True
+    return {"status": status, "source": source, "chunks": len(docs), "sha256": file_hash}
 
 
 app = FastAPI()
+
+# Static files (CSS/JS) + Jinja2 chat template
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 class AskRequest(BaseModel):
     input: str
 
 
+@app.get("/")
+def home(request: Request):
+    """Simple chat UI (Jinja2 template)."""
+    return templates.TemplateResponse(request, "index.html")
+
+
+@app.post("/upload")
+def upload_endpoint(file: UploadFile = File(...)) -> dict:
+    """User ki file lekar Qdrant mein ingest karta hai (skip / ingest / overwrite)."""
+    # .name path traversal se bachata hai (Windows/Linux dono par)
+    filename = Path(file.filename or "").name
+    if not filename or Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
+
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    dest = UPLOAD_DIR / filename
+    dest.write_bytes(data)
+
+    with registry_lock:
+        return ingest_file(dest, sha256_bytes(data))
+
+
 @app.post("/api")
 def ask_grok(body: AskRequest) -> dict:
     question = body.input
 
-    # Pehli /api call par knowledge.pdf load/overwrite hota hai; uske baad no-op
-    ensure_ingested()
-
     # --- STEP 1: DENSE (semantic/meaning-based) search - Qdrant se ---
     dense_docs = vector_store.similarity_search(question, k=20)
+
+    # Knowledge base khali hai - abhi tak koi file upload nahi hui
+    if not dense_docs:
+        return {"content": "I don't know from uploaded PDF."}
 
     # --- STEP 2: RERANKING - results ko query ke against dobara score karo ---
     rerank_result = cohere_client.rerank(
@@ -164,7 +251,7 @@ def ask_grok(body: AskRequest) -> dict:
                 "role": "system",
                 "content": (
                     "You are a RAG AI assistant. STRICT RULES: "
-                    "- Answer ONLY from context "
+                    "- Answer ONLY from context yes but you can also answer basic questions hi how are you like these etc"
                     "- Do not use outside knowledge "
                     '- If answer not found say: "I don\'t know from uploaded PDF." '
                     f"context:{context}"

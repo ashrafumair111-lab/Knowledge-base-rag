@@ -20,3 +20,7 @@ Thumbs.db
 .vscode/
 *.log
 
+# --- Runtime artifacts (app ke apni files) ---
+uploads/
+ingested.json
+
