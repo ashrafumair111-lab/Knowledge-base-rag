@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -30,9 +31,7 @@ COLLECTION_NAME = "grocery store"
 PKG_DIR = Path(__file__).resolve().parent
 
 # Lambda par code dir read-only hota hai -> runtime data hamesha /tmp me jaata hai.
-# NOTE: /tmp har Lambda instance ka alag hota hai -> registry per-instance rahegi.
-# Duplicates phir bhi NAHI bante (delete-by-source + deterministic ids chalte rehte hain),
-# bas ek naya instance pehli baar dobara embed kar sakta hai.
+# NOTE: /tmp per-instance hota hai, isliye shared registry S3 par rehti hai (USE_S3).
 ON_LAMBDA = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 DATA_DIR = Path("/tmp/kb-rag") if ON_LAMBDA else PKG_DIR
 if ON_LAMBDA:
@@ -44,19 +43,19 @@ REGISTRY_PATH = DATA_DIR / "ingested.json"
 # S3 (sirf deployed app/Lambda par) - badi files + sab containers ke liye shared registry
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 REGISTRY_KEY = "_registry/ingested.json"
+USE_S3 = ON_LAMBDA and bool(S3_BUCKET)
 
 # Sirf yehi file types accept hote hain (pypdf / plain text)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
 
-# Fixed namespace: har chunk ka point ID uske text se banaya jata hai, isliye
-# same chunk ka ID hamesha same rehta hai -> overwrite (upsert) reliable hota hai.
+# Chunk ka point ID uske text se banta hai (deterministic) -> overwrite/upsert reliable.
 # NOTE: ye UUID ek baar set karne ke baad KABHI change nahi karni.
 PDF_NAMESPACE = uuid.UUID("a06eab4d-f20e-48c3-af71-b62597a0dc5b")
 
 # Cohere client - reranking (query ke against chunks ko dobara score karne) ke liye
 cohere_client = cohere.Client(api_key=os.environ["COHERE_API_KEY"])
 
-# Answer generate karne wala LLM (Groq) - bilkul wahi model jo index.js mein tha
+# Answer generate karne wala LLM (Groq)
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     temperature=0,
@@ -64,8 +63,6 @@ llm = ChatGroq(
 )
 
 # Embeddings - semantic/meaning-based search ke liye
-# NOTE: Python SDK mein batch_size ka option nahi hai (wo internal handle hota hai),
-# isliye yahan sirf wahi model diya gaya hai jo index.js mein tha.
 embeddings = CohereEmbeddings(
     model="embed-english-v3.0",
 )
@@ -121,18 +118,39 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def s3():
+    """S3 client - Lambda runtime me boto3 pre-installed hota hai."""
+    import boto3
+
+    return boto3.client("s3")
+
+
+def require_s3() -> None:
+    """S3 sirf deployed app par hai - local dev par 400 do."""
+    if not USE_S3:
+        raise HTTPException(
+            status_code=400, detail="S3 upload is only available on the deployed app"
+        )
+
+
+def safe_filename(name: str) -> str:
+    """Base filename + extension check (ek saath path-traversal aur type validation)."""
+    filename = Path(name or "").name
+    if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400, detail="Only PDF, TXT and MD files are supported"
+        )
+    return filename
+
+
 def registry_load() -> dict:
     """Registry padho (file -> sha256/chunks/uploaded_at + "_last" pointer).
 
     Lambda par S3 se (sab containers ke liye EK hi copy), locally ingested.json se.
     """
-    if ON_LAMBDA and S3_BUCKET:
-        import boto3  # Lambda runtime me pre-installed; local venv me nahi
-
+    if USE_S3:
         try:
-            body = boto3.client("s3").get_object(
-                Bucket=S3_BUCKET, Key=REGISTRY_KEY
-            )["Body"].read()
+            body = s3().get_object(Bucket=S3_BUCKET, Key=REGISTRY_KEY)["Body"].read()
             return json.loads(body)
         except Exception:
             return {}
@@ -147,12 +165,8 @@ def registry_load() -> dict:
 def registry_save(registry: dict) -> None:
     """Registry persist karo - Lambda par S3, locally ingested.json."""
     data = json.dumps(registry, indent=2)
-    if ON_LAMBDA and S3_BUCKET:
-        import boto3
-
-        boto3.client("s3").put_object(
-            Bucket=S3_BUCKET, Key=REGISTRY_KEY, Body=data.encode("utf-8")
-        )
+    if USE_S3:
+        s3().put_object(Bucket=S3_BUCKET, Key=REGISTRY_KEY, Body=data.encode("utf-8"))
     else:
         REGISTRY_PATH.write_text(data, encoding="utf-8")
 
@@ -219,9 +233,9 @@ def ingest_file(path: Path, file_hash: str) -> dict:
 
     status = "overwritten" if source in registry else "ingested"
 
-    # --- OVERWRITE: pehle is file ke purane chunks Qdrant se hatao ---
+    # --- OVERWRITE: is file ke SAARE purane chunks Qdrant se hatao ---
     # (legacy "./naam" source bhi saaf hota hai - purane fixed-PDF wale ingest ke liye)
-    qdrant.delete(collection_name=COLLECTION_NAME, points_selector=ids)
+    # ids se alag delete ki zaroorat nahi - ye filter already un points ko pakad leta hai.
     qdrant.delete(
         collection_name=COLLECTION_NAME,
         points_selector=models.Filter(
@@ -258,6 +272,18 @@ templates = Jinja2Templates(directory=str(PKG_DIR / "templates"))
 
 class AskRequest(BaseModel):
     input: str
+    history: list[dict] | None = None
+
+
+def ingest_bytes(filename: str, data: bytes) -> dict:
+    """Bytes ko upload dir me likh kar ingest karo (registry lock ke andar)."""
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    dest = UPLOAD_DIR / filename
+    dest.write_bytes(data)
+    with registry_lock:
+        return ingest_file(dest, sha256_bytes(data))
 
 
 @app.get("/")
@@ -269,21 +295,7 @@ def home(request: Request):
 @app.post("/upload")
 def upload_endpoint(file: UploadFile = File(...)) -> dict:
     """User ki file lekar Qdrant mein ingest karta hai (skip / ingest / overwrite)."""
-    # .name path traversal se bachata hai (Windows/Linux dono par)
-    filename = Path(file.filename or "").name
-    if not filename or Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
-
-    data = file.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-    UPLOAD_DIR.mkdir(exist_ok=True)
-    dest = UPLOAD_DIR / filename
-    dest.write_bytes(data)
-
-    with registry_lock:
-        return ingest_file(dest, sha256_bytes(data))
+    return ingest_bytes(safe_filename(file.filename), file.file.read())
 
 
 class PresignRequest(BaseModel):
@@ -298,18 +310,13 @@ class UploadS3Request(BaseModel):
 @app.post("/presign")
 def presign_endpoint(body: PresignRequest) -> dict:
     """Browser ko temporary S3 PUT URL - badi files Lambda ke 6MB limit se bach jati hain."""
-    if not (ON_LAMBDA and S3_BUCKET):
-        raise HTTPException(status_code=400, detail="S3 upload is only available on the deployed app")
-    import boto3
-
-    filename = Path(body.filename).name
-    if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
+    require_s3()
+    filename = safe_filename(body.filename)
     if body.size and body.size > 200 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (max 200 MB)")
 
     key = f"uploads/{uuid.uuid4().hex}-{filename}"
-    url = boto3.client("s3").generate_presigned_url(
+    url = s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=300,
@@ -320,67 +327,71 @@ def presign_endpoint(body: PresignRequest) -> dict:
 @app.post("/upload-s3")
 def upload_s3_endpoint(body: UploadS3Request) -> dict:
     """Browser S3 me file daal chuka hai - yahan S3 se padh kar ingest hota hai."""
-    if not (ON_LAMBDA and S3_BUCKET):
-        raise HTTPException(status_code=400, detail="S3 upload is only available on the deployed app")
-    import boto3
-
-    key = body.key
-    if not key.startswith("uploads/"):
+    require_s3()
+    if not body.key.startswith("uploads/"):
         raise HTTPException(status_code=400, detail="Invalid upload key")
 
-    obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
-    data = obj["Body"].read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-    filename = Path(key).name.split("-", 1)[-1]
-    if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
-
-    UPLOAD_DIR.mkdir(exist_ok=True)
-    dest_s3 = UPLOAD_DIR / filename
-    dest_s3.write_bytes(data)
-
-    with registry_lock:
-        return ingest_file(dest_s3, sha256_bytes(data))
+    data = s3().get_object(Bucket=S3_BUCKET, Key=body.key)["Body"].read()
+    # presign ne "<uuid>-<filename>" banaya tha - asli naam wapas nikaalo
+    filename = safe_filename(Path(body.key).name.split("-", 1)[-1])
+    return ingest_bytes(filename, data)
 
 
-INTENT_GATE_TOKENS = (
-    "upload", "file", "pdf", "document", "doc",
-    "dala", "daala", "diya", "shamil", "jama", "dale",
+INTENT_GATE_PATTERNS = (
+    r"\bupload", r"\bfile", r"\bpdf", r"\bdocument", r"\bdoc\b",
+    r"\bdala", r"\bdaala", r"\bdiya", r"\bshamil", r"\bjama", r"\bdale",
+    r"\bexplain", r"\bdescrib", r"\bsummar", r"\bdetail", r"\btell me",
+    r"\bit\b", r"\bthis\b", r"\bthat\b", r"\bone\b",
 )
 
 
 def needs_intent_check(question: str) -> bool:
-    """Sirf upload-jaise sawalon par AI se classification - har normal sawal par extra call nahi."""
+    """Upload/follow-up jaise sawalon par AI se classification - seedhe factual sawal par extra call nahi."""
     q = question.lower()
-    return any(t in q for t in INTENT_GATE_TOKENS)
+    return any(re.search(p, q) for p in INTENT_GATE_PATTERNS)
 
 
-def route_intent(question: str, file_names: list, last: str | None) -> str:
-    """AI khud decide karta hai - meta / recent / normal. Sirf ek shabd lautata hai."""
-    files = ", ".join(file_names)
+def format_history(history: list | None, line_limit: int = 600) -> str:
+    """Chat history ko prompt ke liye chhota text banao (follow-ups jaise 'explain it' ke liye)."""
+    if not history:
+        return ""
+    lines = []
+    for m in history[-6:]:
+        who = "User" if m.get("role") == "user" else "Assistant"
+        lines.append(f"{who}: {str(m.get('content', ''))[:line_limit]}")
+    return " | ".join(lines)
+
+
+def route_intent(question: str, file_names: list, last: str | None, history_text: str = "") -> str:
+    """AI decide karta hai: meta / recent / normal / file:<naam>. History se follow-ups resolve hote hain."""
     response = llm.invoke(
         [
             {
                 "role": "system",
                 "content": (
-                    "You are an intent classifier. Reply with exactly ONE word: meta, recent or normal. "
-                    f"Known uploaded files: {files}. "
-                    f"Most recently uploaded file: {last or 'none'}. "
-                    "Classify the USER QUESTION: "
-                    "- meta: user asks WHAT they uploaded, which file, or when - not about its content. "
-                    "- recent: user asks about the CONTENT, summary or meaning of the file they uploaded "
-                    "(for example 'the file I uploaded' or 'the pdf') WITHOUT naming a specific file - "
-                    "for this the recent upload must be used. "
-                    "- normal: any other question, OR the user names a specific file "
-                    "(for example 'according to knowledge.pdf') or a clear topic that belongs to one file."
+                    "You are an intent classifier. Reply with exactly ONE token: "
+                    "meta, recent, normal, or file:<filename>. "
+                    f"Known uploaded files: {', '.join(file_names)}. "
+                    f"Most recently uploaded: {last or 'none'}. "
+                    + (f"Recent conversation: {history_text}. " if history_text else "")
+                    + "Classify the USER QUESTION: "
+                    "- meta: WHAT they uploaded, which file, or when - not its content. "
+                    "- recent: the CONTENT/summary/meaning of the file they uploaded, or refers to it "
+                    "with 'it'/'this'/'the one' without naming a file - use the recent upload. "
+                    "- file:<filename>: clearly refers to ONE specific known file, by name or as the "
+                    "obvious topic of the last turns - use exactly that file. "
+                    "- normal: any other question, not about a specific uploaded file."
                 ),
             },
             {"role": "user", "content": question},
         ]
     )
     ans = (response.content or "").strip().lower()
+    if "file:" in ans:
+        name = ans.split("file:", 1)[1].strip().rstrip(". ,")
+        for known in file_names:
+            if known.lower() == name or (name and name in known.lower()):
+                return "file:" + known
     if "meta" in ans:
         return "meta"
     if "recent" in ans:
@@ -410,9 +421,13 @@ def ask_grok(body: AskRequest) -> dict:
     # Intent: AI khud decide karta hai - meta (kya upload kiya) / recent (us recent file ka content) / normal
     intent = "normal"
     file_names = [k for k in registry if not k.startswith("_")]
+    history = [
+        m for m in (body.history or [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+    ]
     if file_names and needs_intent_check(question):
         try:
-            intent = route_intent(question, file_names, last)
+            intent = route_intent(question, file_names, last, format_history(history))
         except Exception:
             intent = "normal"  # classification fail -> normal RAG (kuch chhupta nahi)
 
@@ -445,10 +460,17 @@ def ask_grok(body: AskRequest) -> dict:
         return {"content": response.content}
 
     # --- STEP 1: DENSE (semantic/meaning-based) search - Qdrant se ---
-    # "recent" intent -> SIRF recent file ke chunks search karo (purani files confuse nahi karengi);
-    # kisi wajah se 0 mile (jaise purani registry entry) to poore KB par fallback
-    dense_docs = []
+    # recent/file intent -> SIRF usi file ke chunks; 0 results ho to poore KB par fallback
+    source_filter = None
     if intent == "recent" and last and last in registry:
+        source_filter = last
+    elif intent.startswith("file:"):
+        candidate = intent[5:]
+        if candidate in registry:
+            source_filter = candidate
+
+    dense_docs = []
+    if source_filter:
         dense_docs = vector_store.similarity_search(
             question,
             k=20,
@@ -456,7 +478,7 @@ def ask_grok(body: AskRequest) -> dict:
                 must=[
                     models.FieldCondition(
                         key="metadata.source",
-                        match=models.MatchValue(value=last),
+                        match=models.MatchValue(value=source_filter),
                     )
                 ]
             ),
@@ -464,9 +486,24 @@ def ask_grok(body: AskRequest) -> dict:
     if not dense_docs:
         dense_docs = vector_store.similarity_search(question, k=20)
 
-    # Knowledge base khali hai - abhi tak koi file upload nahi hui
+    # Knowledge base khali hai - abhi tak koi file upload nahi hui.
+    # Chatbot ki tarah general/chit-chat questions phir bhi answer karo (bina context ke).
     if not dense_docs:
-        return {"content": "I don't know from uploaded PDF."}
+        response = llm.invoke(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a friendly, helpful AI chat assistant. "
+                        "The knowledge base is currently empty (no files uploaded yet), "
+                        "so answer general questions from your own knowledge. "
+                        "If asked about uploaded documents, mention that no file has been uploaded yet."
+                    ),
+                },
+                {"role": "user", "content": question},
+            ]
+        )
+        return {"content": response.content}
 
     # --- STEP 2: RERANKING - results ko query ke against dobara score karo ---
     rerank_result = cohere_client.rerank(
@@ -479,13 +516,19 @@ def ask_grok(body: AskRequest) -> dict:
     top_docs = [dense_docs[result.index] for result in rerank_result.results]
     context = "\n".join(doc.page_content for doc in top_docs)
 
-    # "recent" path: model ko saaf batao ki context USI file ka hai jo user ne upload ki -
+    # filtered path: model ko saaf batao ki context KIS file ka hai -
     # warna wo strict rules dekh kar galat "I don't know" bol deta hai
-    context_note = ""
-    if intent == "recent" and last:
-        context_note = (
-            f"NOTE: The user is asking about the file they uploaded ('{last}'). "
-            "The context below IS content from that same file - answer from it directly. "
+    notes = ""
+    if source_filter:
+        notes += (
+            f"NOTE: this conversation is about '{source_filter}'. The context below IS that "
+            "same file's content - answer from it directly. "
+        )
+    if history:
+        notes += (
+            "Recent conversation (resolve follow-ups like 'explain it' from it): "
+            + format_history(history, 400)
+            + " "
         )
 
     response = llm.invoke(
@@ -493,11 +536,16 @@ def ask_grok(body: AskRequest) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a RAG AI assistant. STRICT RULES: "
-                    "- Answer ONLY from context yes but you can also answer basic questions hi how are you like these etc"
-                    "- Do not use outside knowledge "
-                    '- If answer not found say: "I don\'t know from uploaded PDF." '
-                    f"{context_note}context:{context}"
+                    "You are a friendly AI chat assistant with a knowledge base of the user's "
+                    "uploaded files. RULES: "
+                    "- If the question is about those documents or the context is relevant, answer "
+                    "from the context (ground your answer in it). "
+                    "- Otherwise answer normally from your own knowledge - general facts, chit-chat, "
+                    "greetings, coding, advice, anything. "
+                    "- Never refuse or say you can't answer just because the answer isn't in the context. "
+                    '- Only for questions specifically about the uploaded files where the context has '
+                    'no answer, say: "I don\'t know from uploaded PDF." '
+                    f"{notes}context:{context}"
                 ),
             },
             {"role": "user", "content": question},

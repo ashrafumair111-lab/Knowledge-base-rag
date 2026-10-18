@@ -3,6 +3,8 @@ const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 
+const history = []; // chat context - follow-ups backend ko bhejne ke liye
+
 const fileInput = document.getElementById("file-input");
 const fileLabelText = document.getElementById("file-label-text");
 const fileClear = document.getElementById("file-clear");
@@ -185,6 +187,7 @@ chatForm.addEventListener("submit", async (e) => {
   if (!question) return;
 
   addMessage(question, "user");
+  history.push({ role: "user", content: question });
   chatInput.value = "";
 
   sendBtn.disabled = true;
@@ -194,13 +197,14 @@ chatForm.addEventListener("submit", async (e) => {
     const res = await fetch("/api", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: question }),
+      body: JSON.stringify({ input: question, history: history.slice(-12) }),
     });
     const data = await res.json();
 
     typing.remove();
     if (!res.ok) throw new Error(data.detail || "Request failed");
     addMessage(data.content, "bot");
+    history.push({ role: "assistant", content: data.content });
   } catch (err) {
     typing.remove();
     addMessage(err.message, "error");
