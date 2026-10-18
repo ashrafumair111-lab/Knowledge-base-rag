@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cohere
@@ -40,6 +41,10 @@ if ON_LAMBDA:
 UPLOAD_DIR = DATA_DIR / "uploads"
 REGISTRY_PATH = DATA_DIR / "ingested.json"
 
+# S3 (sirf deployed app/Lambda par) - badi files + sab containers ke liye shared registry
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
+REGISTRY_KEY = "_registry/ingested.json"
+
 # Sirf yehi file types accept hote hain (pypdf / plain text)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
 
@@ -72,19 +77,28 @@ qdrant = QdrantClient(
     api_key=os.environ["QDRANT_API_KEY"],
 )
 
-if not qdrant.collection_exists(COLLECTION_NAME):
-    qdrant.create_collection(
+def ensure_collection() -> None:
+    """Collection + payload index ensure karo (idempotent, self-healing).
+
+    Qdrant me collection delete karne par app khud dobara bana deta hai -
+    warna warm Lambda container har upload/ask par 500 deta rehta.
+    """
+    if not qdrant.collection_exists(COLLECTION_NAME):
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
+        )
+    # "metadata.source" par filter karne ke liye Qdrant ko payload index chahiye,
+    # warna delete() 400 Bad Request deta hai. Ye call idempotent hai.
+    qdrant.create_payload_index(
         collection_name=COLLECTION_NAME,
-        vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
+        field_name="metadata.source",
+        field_schema=models.PayloadSchemaType.KEYWORD,
     )
 
-# "metadata.source" par filter karne ke liye Qdrant ko payload index chahiye,
-# warna delete() 400 Bad Request deta hai. Ye call idempotent hai.
-qdrant.create_payload_index(
-    collection_name=COLLECTION_NAME,
-    field_name="metadata.source",
-    field_schema=models.PayloadSchemaType.KEYWORD,
-)
+
+# Startup par ensure (fast-fail); har upload/ask par dobara (heal agar collection delete ho)
+ensure_collection()
 
 # Dense vector store (Qdrant) - ye SEMANTIC search ka engine hai
 vector_store = QdrantVectorStore(
@@ -108,13 +122,39 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def registry_load() -> dict:
-    """ingested.json padho (source -> sha256 + chunks). Corrupt ho to fresh start."""
+    """Registry padho (file -> sha256/chunks/uploaded_at + "_last" pointer).
+
+    Lambda par S3 se (sab containers ke liye EK hi copy), locally ingested.json se.
+    """
+    if ON_LAMBDA and S3_BUCKET:
+        import boto3  # Lambda runtime me pre-installed; local venv me nahi
+
+        try:
+            body = boto3.client("s3").get_object(
+                Bucket=S3_BUCKET, Key=REGISTRY_KEY
+            )["Body"].read()
+            return json.loads(body)
+        except Exception:
+            return {}
     if REGISTRY_PATH.exists():
         try:
             return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def registry_save(registry: dict) -> None:
+    """Registry persist karo - Lambda par S3, locally ingested.json."""
+    data = json.dumps(registry, indent=2)
+    if ON_LAMBDA and S3_BUCKET:
+        import boto3
+
+        boto3.client("s3").put_object(
+            Bucket=S3_BUCKET, Key=REGISTRY_KEY, Body=data.encode("utf-8")
+        )
+    else:
+        REGISTRY_PATH.write_text(data, encoding="utf-8")
 
 
 def extract_text(path: Path) -> str:
@@ -147,11 +187,16 @@ def ingest_file(path: Path, file_hash: str) -> dict:
     - Agar naam same lekin content naya -> OVERWRITE (purane chunks delete, naye insert)
     - Bilkul naya file -> ingest
     """
+    ensure_collection()
+
     source = path.name
     registry = registry_load()
 
     # --- SKIP: same file already in Qdrant -> dobara embed mat karo ---
     if registry.get(source, {}).get("sha256") == file_hash and source_chunk_count(source) > 0:
+        # Yehi file dobara upload hui - "recent upload" yahi mana jayega
+        registry["_last"] = source
+        registry_save(registry)
         return {
             "status": "skipped",
             "source": source,
@@ -192,8 +237,14 @@ def ingest_file(path: Path, file_hash: str) -> dict:
     # --- phir fresh chunks daalo (ids dene se ye upsert ban jata hai) ---
     vector_store.add_documents(docs, ids=ids)
 
-    registry[source] = {"sha256": file_hash, "chunks": len(docs)}
-    REGISTRY_PATH.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+    registry[source] = {
+        "sha256": file_hash,
+        "chunks": len(docs),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "preview": text[:300],
+    }
+    registry["_last"] = source  # "recent upload" pointer - "what did I upload" isi se milta hai
+    registry_save(registry)
 
     return {"status": status, "source": source, "chunks": len(docs), "sha256": file_hash}
 
@@ -235,12 +286,183 @@ def upload_endpoint(file: UploadFile = File(...)) -> dict:
         return ingest_file(dest, sha256_bytes(data))
 
 
+class PresignRequest(BaseModel):
+    filename: str
+    size: int = 0
+
+
+class UploadS3Request(BaseModel):
+    key: str
+
+
+@app.post("/presign")
+def presign_endpoint(body: PresignRequest) -> dict:
+    """Browser ko temporary S3 PUT URL - badi files Lambda ke 6MB limit se bach jati hain."""
+    if not (ON_LAMBDA and S3_BUCKET):
+        raise HTTPException(status_code=400, detail="S3 upload is only available on the deployed app")
+    import boto3
+
+    filename = Path(body.filename).name
+    if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
+    if body.size and body.size > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 200 MB)")
+
+    key = f"uploads/{uuid.uuid4().hex}-{filename}"
+    url = boto3.client("s3").generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=300,
+    )
+    return {"upload_url": url, "key": key}
+
+
+@app.post("/upload-s3")
+def upload_s3_endpoint(body: UploadS3Request) -> dict:
+    """Browser S3 me file daal chuka hai - yahan S3 se padh kar ingest hota hai."""
+    if not (ON_LAMBDA and S3_BUCKET):
+        raise HTTPException(status_code=400, detail="S3 upload is only available on the deployed app")
+    import boto3
+
+    key = body.key
+    if not key.startswith("uploads/"):
+        raise HTTPException(status_code=400, detail="Invalid upload key")
+
+    obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
+    data = obj["Body"].read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    filename = Path(key).name.split("-", 1)[-1]
+    if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are supported")
+
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    dest_s3 = UPLOAD_DIR / filename
+    dest_s3.write_bytes(data)
+
+    with registry_lock:
+        return ingest_file(dest_s3, sha256_bytes(data))
+
+
+INTENT_GATE_TOKENS = (
+    "upload", "file", "pdf", "document", "doc",
+    "dala", "daala", "diya", "shamil", "jama", "dale",
+)
+
+
+def needs_intent_check(question: str) -> bool:
+    """Sirf upload-jaise sawalon par AI se classification - har normal sawal par extra call nahi."""
+    q = question.lower()
+    return any(t in q for t in INTENT_GATE_TOKENS)
+
+
+def route_intent(question: str, file_names: list, last: str | None) -> str:
+    """AI khud decide karta hai - meta / recent / normal. Sirf ek shabd lautata hai."""
+    files = ", ".join(file_names)
+    response = llm.invoke(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are an intent classifier. Reply with exactly ONE word: meta, recent or normal. "
+                    f"Known uploaded files: {files}. "
+                    f"Most recently uploaded file: {last or 'none'}. "
+                    "Classify the USER QUESTION: "
+                    "- meta: user asks WHAT they uploaded, which file, or when - not about its content. "
+                    "- recent: user asks about the CONTENT, summary or meaning of the file they uploaded "
+                    "(for example 'the file I uploaded' or 'the pdf') WITHOUT naming a specific file - "
+                    "for this the recent upload must be used. "
+                    "- normal: any other question, OR the user names a specific file "
+                    "(for example 'according to knowledge.pdf') or a clear topic that belongs to one file."
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+    )
+    ans = (response.content or "").strip().lower()
+    if "meta" in ans:
+        return "meta"
+    if "recent" in ans:
+        return "recent"
+    return "normal"
+
+
+def last_uploaded_source(registry: dict) -> str | None:
+    """_last pointer, ya purani registry ke liye sabse nayi uploaded_at entry."""
+    last = registry.get("_last")
+    if last:
+        return last
+    files = {k: v for k, v in registry.items() if not k.startswith("_")}
+    if not files:
+        return None
+    return max(files.items(), key=lambda kv: kv[1].get("uploaded_at", ""))[0]
+
+
 @app.post("/api")
 def ask_grok(body: AskRequest) -> dict:
     question = body.input
+    ensure_collection()
+
+    registry = registry_load()
+    last = last_uploaded_source(registry)
+
+    # Intent: AI khud decide karta hai - meta (kya upload kiya) / recent (us recent file ka content) / normal
+    intent = "normal"
+    file_names = [k for k in registry if not k.startswith("_")]
+    if file_names and needs_intent_check(question):
+        try:
+            intent = route_intent(question, file_names, last)
+        except Exception:
+            intent = "normal"  # classification fail -> normal RAG (kuch chhupta nahi)
+
+    # --- meta: "Maine kya upload kiya?" -> RAG nahi, registry seedha jawab ---
+    if intent == "meta":
+        if not last or last not in registry:
+            return {"content": "Abhi tak koi file upload nahi hui."}
+        info = registry[last]
+        context = (
+            f"Most recently uploaded file: {last}\n"
+            f"Type: {Path(last).suffix.upper().lstrip('.')}\n"
+            f"Chunks in knowledge base: {info.get('chunks', 'unknown')}\n"
+            f"Uploaded at (UTC): {info.get('uploaded_at', 'unknown')}"
+            f" Preview (first 300 chars): {info.get('preview', 'n/a')}"
+        )
+        response = llm.invoke(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant. Using ONLY the file information in the context, "
+                        "answer the user's question about what they uploaded. Be concise. "
+                        "If they ask what the file contains, say you can answer questions about its content."
+                        f"\ncontext:{context}"
+                    ),
+                },
+                {"role": "user", "content": question},
+            ]
+        )
+        return {"content": response.content}
 
     # --- STEP 1: DENSE (semantic/meaning-based) search - Qdrant se ---
-    dense_docs = vector_store.similarity_search(question, k=20)
+    # "recent" intent -> SIRF recent file ke chunks search karo (purani files confuse nahi karengi);
+    # kisi wajah se 0 mile (jaise purani registry entry) to poore KB par fallback
+    dense_docs = []
+    if intent == "recent" and last and last in registry:
+        dense_docs = vector_store.similarity_search(
+            question,
+            k=20,
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.source",
+                        match=models.MatchValue(value=last),
+                    )
+                ]
+            ),
+        )
+    if not dense_docs:
+        dense_docs = vector_store.similarity_search(question, k=20)
 
     # Knowledge base khali hai - abhi tak koi file upload nahi hui
     if not dense_docs:
@@ -257,6 +479,15 @@ def ask_grok(body: AskRequest) -> dict:
     top_docs = [dense_docs[result.index] for result in rerank_result.results]
     context = "\n".join(doc.page_content for doc in top_docs)
 
+    # "recent" path: model ko saaf batao ki context USI file ka hai jo user ne upload ki -
+    # warna wo strict rules dekh kar galat "I don't know" bol deta hai
+    context_note = ""
+    if intent == "recent" and last:
+        context_note = (
+            f"NOTE: The user is asking about the file they uploaded ('{last}'). "
+            "The context below IS content from that same file - answer from it directly. "
+        )
+
     response = llm.invoke(
         [
             {
@@ -266,7 +497,7 @@ def ask_grok(body: AskRequest) -> dict:
                     "- Answer ONLY from context yes but you can also answer basic questions hi how are you like these etc"
                     "- Do not use outside knowledge "
                     '- If answer not found say: "I don\'t know from uploaded PDF." '
-                    f"context:{context}"
+                    f"{context_note}context:{context}"
                 ),
             },
             {"role": "user", "content": question},
