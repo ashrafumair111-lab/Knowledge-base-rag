@@ -1,0 +1,27 @@
+# Local/dev/runtime files - image me kabhi mat daalo
+.venv/
+venv/
+.git/
+__pycache__/
+*.pyc
+
+# Secrets - kabhi image me nahi!
+.env
+.env.*
+*.env
+
+# Runtime artifacts (Lambda /tmp par bante hain)
+uploads/
+ingested.json
+*.log
+
+# Not needed inside the image
+knowledge.pdf
+README.md
+pyproject.toml
+uv.lock
+.python-version
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

@@ -15,6 +15,7 @@ from langchain_cohere import CohereEmbeddings
 from langchain_groq import ChatGroq
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from mangum import Mangum
 from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
@@ -24,9 +25,20 @@ load_dotenv()
 
 COLLECTION_NAME = "grocery store"
 
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-REGISTRY_PATH = BASE_DIR / "ingested.json"
+# Package dir = code/templates/static ka asli location (Lambda par READ-ONLY hota hai)
+PKG_DIR = Path(__file__).resolve().parent
+
+# Lambda par code dir read-only hota hai -> runtime data hamesha /tmp me jaata hai.
+# NOTE: /tmp har Lambda instance ka alag hota hai -> registry per-instance rahegi.
+# Duplicates phir bhi NAHI bante (delete-by-source + deterministic ids chalte rehte hain),
+# bas ek naya instance pehli baar dobara embed kar sakta hai.
+ON_LAMBDA = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+DATA_DIR = Path("/tmp/kb-rag") if ON_LAMBDA else PKG_DIR
+if ON_LAMBDA:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+UPLOAD_DIR = DATA_DIR / "uploads"
+REGISTRY_PATH = DATA_DIR / "ingested.json"
 
 # Sirf yehi file types accept hote hain (pypdf / plain text)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
@@ -189,8 +201,8 @@ def ingest_file(path: Path, file_hash: str) -> dict:
 app = FastAPI()
 
 # Static files (CSS/JS) + Jinja2 chat template
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(PKG_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(PKG_DIR / "templates"))
 
 
 class AskRequest(BaseModel):
@@ -262,6 +274,10 @@ def ask_grok(body: AskRequest) -> dict:
     )
 
     return {"content": response.content}
+
+
+# AWS Lambda entry point - Mangum Lambda event ko FastAPI request banata hai
+handler = Mangum(app, lifespan="off")
 
 
 if __name__ == "__main__":
