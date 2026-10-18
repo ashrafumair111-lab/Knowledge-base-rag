@@ -3,6 +3,8 @@ const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 
+const history = []; // chat context - follow-ups backend ko bhejne ke liye
+
 const fileInput = document.getElementById("file-input");
 const fileLabelText = document.getElementById("file-label-text");
 const fileClear = document.getElementById("file-clear");
@@ -82,17 +84,49 @@ function onFileSelected(file) {
   uploadStatus.textContent = "";
 }
 
+const BIG_FILE_BYTES = 4 * 1024 * 1024; // 4 MB se bada -> S3 direct (sirf deployed app par)
+
+async function ingestViaS3(file) {
+  const pre = await fetch("/presign", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: file.name, size: file.size }),
+  });
+  if (!pre.ok) return null; // S3 available nahi (local dev) -> caller multipart try kare
+  const preData = await pre.json();
+  const put = await fetch(preData.upload_url, { method: "PUT", body: file });
+  if (!put.ok) throw new Error("S3 upload failed (HTTP " + put.status + ")");
+  setUploadStatus("Processing\u2026", "busy");
+  const res = await fetch("/upload-s3", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: preData.key }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Ingest failed");
+  return data;
+}
+
 async function uploadFile(file) {
   uploadBtn.disabled = true;
-  setUploadStatus("Uploading\u2026", "busy");
-
-  const form = new FormData();
-  form.append("file", file);
-
   try {
-    const res = await fetch("/upload", { method: "POST", body: form });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Upload failed");
+    let data = null;
+    if (file.size > BIG_FILE_BYTES) {
+      setUploadStatus("Uploading directly to S3\u2026", "busy");
+      try {
+        data = await ingestViaS3(file);
+      } catch (err) {
+        setUploadStatus("S3 failed, trying direct\u2026", "busy");
+      }
+    }
+    if (!data) {
+      setUploadStatus("Uploading\u2026", "busy");
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/upload", { method: "POST", body: form });
+      data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Upload failed");
+    }
 
     const labels = {
       ingested: ["\u2713 ingested", "ok"],
@@ -153,6 +187,7 @@ chatForm.addEventListener("submit", async (e) => {
   if (!question) return;
 
   addMessage(question, "user");
+  history.push({ role: "user", content: question });
   chatInput.value = "";
 
   sendBtn.disabled = true;
@@ -162,13 +197,14 @@ chatForm.addEventListener("submit", async (e) => {
     const res = await fetch("/api", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: question }),
+      body: JSON.stringify({ input: question, history: history.slice(-12) }),
     });
     const data = await res.json();
 
     typing.remove();
     if (!res.ok) throw new Error(data.detail || "Request failed");
     addMessage(data.content, "bot");
+    history.push({ role: "assistant", content: data.content });
   } catch (err) {
     typing.remove();
     addMessage(err.message, "error");

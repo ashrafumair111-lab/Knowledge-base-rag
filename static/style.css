@@ -76,9 +76,10 @@ body::after {
 
 .app {
   max-width: 900px;
-  height: 100vh;
+  height: 100vh; /* fallback - old browsers */
+  height: 100dvh; /* mobile - sirf visible viewport, URL bar ke peeche nahi jata */
   margin: 0 auto;
-  padding: 18px 18px 16px;
+  padding: 18px 18px calc(16px + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -641,7 +642,7 @@ body::after {
 
 @media (max-width: 640px) {
   .app {
-    padding: 10px;
+    padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
     gap: 9px;
   }
 
