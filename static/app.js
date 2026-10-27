@@ -12,6 +12,10 @@ const uploadBtn = document.getElementById("upload-btn");
 const uploadStatus = document.getElementById("upload-status");
 const dropzone = document.getElementById("dropzone");
 
+// Har page load (refresh ya naya tab) par naya id banta hai.
+// Backend isi id se filter karta hai, isliye purane uploads naye tab ko nahi dikhte.
+const SESSION_ID = crypto.randomUUID();
+
 const BOT_SVG =
   '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.2 5.8L20 10l-5.8 2.2L12 18l-2.2-5.8L4 10l5.8-2.2z"/></svg>';
 
@@ -99,7 +103,10 @@ async function ingestViaS3(file) {
   setUploadStatus("Processing\u2026", "busy");
   const res = await fetch("/upload-s3", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Id": SESSION_ID,
+    },
     body: JSON.stringify({ key: preData.key }),
   });
   const data = await res.json();
@@ -123,7 +130,11 @@ async function uploadFile(file) {
       setUploadStatus("Uploading\u2026", "busy");
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch("/upload", { method: "POST", body: form });
+      const res = await fetch("/upload", {
+        method: "POST",
+        body: form,
+        headers: { "X-Session-Id": SESSION_ID },
+      });
       data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Upload failed");
     }
@@ -196,7 +207,10 @@ chatForm.addEventListener("submit", async (e) => {
   try {
     const res = await fetch("/api", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Session-Id": SESSION_ID,
+      },
       body: JSON.stringify({ input: question, history: history.slice(-12) }),
     });
     const data = await res.json();
