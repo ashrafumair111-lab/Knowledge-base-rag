@@ -147,9 +147,27 @@ The following fall short of Articles V and VIII today. They shall be corrected o
 1. Endpoints are unauthenticated and the session identifier is client-chosen.
 2. No rate limiting; upload size is not uniformly bounded.
 3. No relevance cutoff and no source citations in answers.
-4. No automated test suite exists yet, and no automated evaluation of retrieval or generation.
+4. The test suite covers the endpoints with external services faked, but there is no automated evaluation of retrieval or generation, and the grounding and prompt-injection guard tests (Article VIII §5) await such an evaluation set.
 5. The self-healing wrapper retries on any exception and can mask real faults.
 6. The shared upload registry is not safe under concurrent instances.
-7. Retrieval is semantic only, and the client libraries and models may be behind current releases.
+7. Retrieval is semantic only.
 8. Client-supplied chat history is trusted.
 9. Locally written upload and registry files are never cleaned up.
+10. Not every external call has an explicit timeout and bounded retries: the language-model and vector-store clients do, the re-ranking and object-storage clients rely on library defaults (Article V §4).
+11. The vector-store client contacts the server when the module is imported, breaching Article III §5.
+
+## Article XII — Use of Skills
+
+1. **Section 1 — Duty.** Before acting on a request, the contributor shall check which available skills fit it and use them. If no skill fits, proceed without one; never force a skill that does not apply.
+2. **Section 2 — Skills by kind of request.**
+   - **Writing, fixing or refactoring code:** `ponytail` (Article VII) and `python-guidelines`.
+   - **New feature or behaviour change:** `superpowers:brainstorming` first, then `superpowers:writing-plans` if the work has several steps.
+   - **Writing tests or a bug fix:** `superpowers:test-driven-development` (Article VIII).
+   - **Bug, failing test or unexpected behaviour:** `superpowers:systematic-debugging`, before proposing a fix.
+   - **Claiming work is done:** `superpowers:verification-before-completion` (Article X §3).
+   - **Reviewing changes:** `code-review`, `simplify` and `security-review`; `ponytail-review` for minimalism.
+   - **Commit, push or pull request:** `commit-commands:commit`, `commit-commands:commit-push-pr`, `github-dev:create-pr`, only when asked (Article X §2).
+   - **Library or SDK questions:** the Context7 documentation tool (Article IX §4).
+   - **Any frontend or UI work:** `design-taste-frontend`.
+3. **Section 3 — Limits.** A skill never overrides this Constitution. Where a skill conflicts with Articles II, III, IV or X, the Constitution prevails.
+4. **Section 4 — Vetting.** A newly installed skill shall be read before first use, because skills run with full agent permissions. Its installed files shall not be committed unless the owner asks.

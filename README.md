@@ -35,7 +35,7 @@ The pipeline is identical, with one deliberate simplification:
    - Same file name, new content → old chunks are **overwritten** (deleted + re-inserted).
 2. **On every question** it embeds the query, retrieves the 20 most semantically similar
    chunks across **all** uploaded files, re-ranks them with Cohere, and keeps the best 5.
-3. A Groq-hosted LLM generates the final answer using **only** that retrieved context.
+3. A Gemini-hosted LLM generates the final answer using **only** that retrieved context.
    If the answer is not present in the documents, it replies:
    `I don't know from uploaded PDF.`
 
@@ -61,7 +61,7 @@ EVERY POST /api CALL
       -> Cohere embed-english-v3.0      embed the query
       -> Qdrant similarity_search(k=20) semantic / dense retrieval
       -> Cohere rerank-english-v3.0     re-rank, keep top_n=5
-      -> Groq openai/gpt-oss-120b       temperature=0, strict prompt
+      -> Gemini (GEMINI_MODEL)        strict prompt
       -> { "content": "..." }
 ```
 
@@ -80,7 +80,7 @@ EVERY POST /api CALL
 | Embeddings | Cohere `embed-english-v3.0` (1024 dimensions) |
 | Vector database | Qdrant, collection `grocery store`, cosine distance |
 | Re-ranking | Cohere `rerank-english-v3.0`, `top_n=5` |
-| LLM | Groq `openai/gpt-oss-120b`, `temperature=0` |
+| LLM | Google Gemini (`GEMINI_MODEL`) |
 | PDF parsing | pypdf |
 | Text splitting | LangChain `RecursiveCharacterTextSplitter` |
 
@@ -90,7 +90,7 @@ EVERY POST /api CALL
 
 - **uv** — it will download and manage Python 3.12 automatically.
 - A **Cohere** API key (used for embeddings and re-ranking).
-- A **Groq** API key (used for answer generation).
+- A **Google (Gemini)** API key (used for answer generation).
 - A **Qdrant** instance (URL and API key). The collection is created automatically if it
   does not exist, together with the payload index needed for filtering.
 
@@ -116,7 +116,7 @@ uv --version
 Create a `.env` file in the project root (this file is git-ignored and must never be committed):
 
 ```ini
-GROQ_API_KEY=your_groq_api_key
+GOOGLE_API_KEY=your_gemini_api_key
 COHERE_API_KEY=your_cohere_api_key
 QDRANT_URL=https://your-cluster.region.aws.cloud.qdrant.io
 QDRANT_API_KEY=your_qdrant_api_key
@@ -260,7 +260,9 @@ All configuration is read from `.env`:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | yes | Authenticates requests to the Groq LLM API. |
+| `GOOGLE_API_KEY` | yes | Authenticates requests to the Gemini API. |
+| `GEMINI_MODEL` | yes | Gemini model code, e.g. one listed on ai.google.dev/gemini-api/docs/models. |
+| `LLM_TIMEOUT_SECONDS` | yes | Timeout for each Gemini call. |
 | `COHERE_API_KEY` | yes | Authenticates embedding and re-ranking requests. |
 | `QDRANT_URL` | yes | URL of the Qdrant cluster. |
 | `QDRANT_API_KEY` | yes | Authenticates requests to Qdrant Cloud. |
@@ -276,7 +278,7 @@ The tunable values are currently hard-coded in `main.py`:
 | Accepted file types | `.pdf`, `.txt`, `.md`, `.markdown` | `ALLOWED_EXTENSIONS` |
 | Duplicate detection | sha256 per filename | `ingested.json` registry |
 | Point id namespace | fixed UUID | `PDF_NAMESPACE` - must never change |
-| LLM model | `openai/gpt-oss-120b` | `ChatGroq(...)` |
+| LLM model | `GEMINI_MODEL` env | `ChatGoogleGenerativeAI(...)` |
 
 ---
 
@@ -328,5 +330,5 @@ Ingestion is **explicit** (upload-driven) and **idempotent**:
    non-English documents.
 5. **PDF, TXT and MD only.** Other file types are rejected with `400 Bad Request`.
    Uploaded files are stored under `uploads/`.
-6. **No custom retry or timeout policy** beyond each SDK's defaults.
+6. **Only the Gemini and Qdrant calls have explicit timeouts**; Cohere and S3 use each SDK's defaults.
 

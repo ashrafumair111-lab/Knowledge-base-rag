@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from langchain_cohere import CohereEmbeddings
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from mangum import Mangum
@@ -53,10 +53,12 @@ PDF_NAMESPACE = uuid.UUID("a06eab4d-f20e-48c3-af71-b62597a0dc5b")
 # Cohere client - reranking (query ke against chunks ko dobara score karne) ke liye
 cohere_client = cohere.Client(api_key=os.environ["COHERE_API_KEY"])
 
-# Answer generate karne wala LLM (Groq)
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0,
+# Answer generate karne wala LLM (Gemini) - GOOGLE_API_KEY env se uthata hai.
+# Model + timeout env se aate hain (Google models retire hote rehte hain, hardcode nahi).
+# temperature set nahi - Gemini 3+ docs explicit temperature ko discourage karte hain.
+llm = ChatGoogleGenerativeAI(
+    model=os.environ["GEMINI_MODEL"],
+    timeout=float(os.environ["LLM_TIMEOUT_SECONDS"]),
     max_retries=2,
 )
 
@@ -450,7 +452,8 @@ def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
         ]
     )
 
-    return {"content": response.content}
+    # .text -> Gemini 3 content blocks (thinking/text) me se sirf answer text deta hai
+    return {"content": response.text}
 
 
 # AWS Lambda entry point - Mangum Lambda event ko FastAPI request banata hai
