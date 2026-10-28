@@ -3,73 +3,140 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
-  <title>Knowledge Base RAG — Chat</title>
+  <title>Knowledge Base — Ask your documents</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="app">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="logo" aria-hidden="true">
-        <svg viewBox="0 0 24 24">
-          <path d="M12 2l2.2 5.8L20 10l-5.8 2.2L12 18l-2.2-5.8L4 10l5.8-2.2z"/>
-          <path d="M19 15l.9 2.4L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.6z" opacity=".75"/>
-        </svg>
+  <div class="shell">
+    <!-- Phone top bar -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H18v13H6.5A1.5 1.5 0 0 0 5 18.5z"/><path d="M5 18.5A1.5 1.5 0 0 0 6.5 20H18v-3"/><path d="M9 8.5h5.5M9 12h3.5"/></svg>
+        </span>
+        <span class="brand-name">Knowledge Base</span>
       </div>
-      <div class="header-text">
-        <h1>Knowledge Base <span class="gradient-text">RAG</span></h1>
-        <p>Upload a PDF, TXT or MD file — then ask anything about it.</p>
-      </div>
-      <div class="online-badge"><span class="dot"></span>Online</div>
+      <button id="files-toggle" class="pill pill-lg" type="button" aria-controls="side" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+        <span>Files &middot; <span id="files-top-count">0</span></span>
+      </button>
     </header>
 
-    <!-- Upload / drop zone -->
-    <section class="upload-bar" id="dropzone">
-      <label class="file-label" for="file-input">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-        </svg>
-        <span id="file-label-text">Choose file&hellip;</span>
-        <input type="file" id="file-input" accept=".pdf,.txt,.md,.markdown" />
-      </label>
-      <button id="file-clear" class="file-clear" type="button" hidden aria-label="Remove selected file">&times;</button>
-      <button id="upload-btn" type="button" disabled>Upload</button>
-      <span id="upload-status" class="upload-status"></span>
-      <span class="drop-hint">or drag &amp; drop here</span>
-    </section>
-
-    <!-- Chat area -->
-    <main id="chat" class="chat" aria-live="polite">
-      <div class="empty-state">
-        <div class="empty-icon" aria-hidden="true">✨</div>
-        <h2>Ask anything about your files</h2>
-        <p>Upload a document above to grow your knowledge base,<br />then start the conversation.</p>
+    <!-- Sidebar: add files + files in this session -->
+    <aside id="side" class="side" aria-label="Files">
+      <div class="side-head">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H18v13H6.5A1.5 1.5 0 0 0 5 18.5z"/><path d="M5 18.5A1.5 1.5 0 0 0 6.5 20H18v-3"/><path d="M9 8.5h5.5M9 12h3.5"/></svg>
+          </span>
+          <span class="brand-name">Knowledge Base</span>
+        </div>
+        <button id="side-close" class="icon-btn side-close" type="button" aria-label="Close files">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
       </div>
+
+      <!-- Upload / drop zone -->
+      <section class="add-card" id="dropzone">
+        <div class="add-top">
+          <span class="add-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V5M7.5 9.5L12 5l4.5 4.5"/><path d="M5 15v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/></svg>
+          </span>
+          <div>
+            <div class="add-title">Add a file</div>
+            <div class="add-sub">PDF, TXT or MD. Drop it here.</div>
+          </div>
+        </div>
+        <div class="add-actions">
+          <label class="pill" for="file-input">
+            <span id="file-label-text">Choose file&hellip;</span>
+            <input type="file" id="file-input" accept=".pdf,.txt,.md,.markdown" />
+          </label>
+          <button id="file-clear" class="icon-btn file-clear" type="button" hidden aria-label="Remove selected file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+          <button id="upload-btn" class="pill pill-solid" type="button" disabled>Upload</button>
+        </div>
+        <span id="upload-status" class="upload-status" role="status"></span>
+      </section>
+
+      <section class="files">
+        <div class="files-head">
+          <h2>Files in this session</h2>
+          <span id="file-count">0 files</span>
+        </div>
+        <div id="file-list" class="file-list">
+          <p id="file-empty" class="file-empty">Nothing here yet. Files you add are listed with how many passages each one holds.</p>
+        </div>
+      </section>
+
+      <div class="online"><span class="dot" aria-hidden="true"></span>Online &middot; files stay in this session only</div>
+    </aside>
+
+    <!-- Main sheet -->
+    <main class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">
+          <h1>Ask your documents</h1>
+          <p id="sheet-sub">Add a file first, then ask about it in plain words.</p>
+        </div>
+        <button id="clear-chat" class="pill" type="button" hidden>Clear chat</button>
+      </div>
+
+      <div id="chat" class="chat" aria-live="polite">
+        <div class="empty-state">
+          <span class="empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H18v13H6.5A1.5 1.5 0 0 0 5 18.5z"/><path d="M5 18.5A1.5 1.5 0 0 0 6.5 20H18v-3"/><path d="M9 8.5h5.5M9 12h3.5"/></svg>
+          </span>
+          <h2>Start with a document, then ask a question.</h2>
+          <p>Add a PDF, a text file or a Markdown note. It is split into short passages and indexed for this session only.</p>
+          <p>Then ask anything about it. Each answer is built from your files, and if they do not say, you will be told so.</p>
+          <div class="tips">
+            <div class="tips-title">Questions that work well</div>
+            <button class="tip tip-sky" type="button">What are the main points of chapter 3?</button>
+            <button class="tip tip-mint" type="button">Summarize the refund policy in two sentences.</button>
+            <button class="tip tip-peach" type="button">Which file mentions the delivery deadline?</button>
+          </div>
+        </div>
+      </div>
+
+      <form id="chat-form" class="composer">
+        <div class="box">
+          <label for="chat-input" class="sr-only">Your question</label>
+          <textarea id="chat-input" rows="2" placeholder="Ask a question about your files" autocomplete="off"></textarea>
+          <div class="box-row">
+            <button id="attach-btn" class="icon-btn attach" type="button" aria-label="Add a file">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button id="send-btn" class="send" type="submit" aria-label="Send message">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+            </button>
+          </div>
+        </div>
+        <p class="helper">Answers use your files when they cover the question. Check important details in the source.</p>
+      </form>
     </main>
-
-    <!-- Message input -->
-    <form id="chat-form" class="chat-form">
-      <div class="input-wrap">
-        <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-        </svg>
-        <input
-          id="chat-input"
-          type="text"
-          placeholder="Ask a question about your uploaded files&hellip;"
-          autocomplete="off"
-          required
-        />
-      </div>
-      <button id="send-btn" type="submit" aria-label="Send message">
-        <span>Send</span>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
-        </svg>
-      </button>
-    </form>
   </div>
 
-  <script src="/static/app.js?v=3"></script>
+  <!-- File viewer: opens when a file in the sidebar is clicked -->
+  <dialog id="viewer" class="viewer" aria-labelledby="viewer-title">
+    <div class="viewer-head">
+      <div class="viewer-heading">
+        <h2 id="viewer-title"></h2>
+        <p id="viewer-meta"></p>
+      </div>
+      <button id="viewer-close" class="icon-btn" type="button" aria-label="Close file">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div id="viewer-body" class="viewer-body" tabindex="0"></div>
+  </dialog>
+
+  <script src="/static/vendor/marked.umd.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>
