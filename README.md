@@ -207,8 +207,35 @@ Answers a question using the ingested PDF as the only source of truth.
 **Response — `200 OK`**
 
 ```json
-{ "content": "The catalog lists two types of rice: Basmati rice (1 kg) at Rs 220-400 and IRRI rice (1 kg) at Rs 130-220." }
+{
+  "content": "The catalog lists two types of rice: Basmati rice (1 kg) at Rs 220-400 and IRRI rice (1 kg) at Rs 130-220.",
+  "sources": ["catalog.pdf"]
+}
 ```
+
+`sources` lists the files behind the answer: re-ranked chunks scoring at least `SOURCE_MIN_SCORE`
+(in `main.py`), de-duplicated. It is empty when no file was relevant.
+
+### Sessions and `GET /session/files`
+
+The page load (`GET /`) gives each browser a signed, `HttpOnly`, `SameSite=Lax` cookie `kb_sid`
+(`Secure` over HTTPS, 14 days, renewed on every page load). It is the session id, so a refresh
+keeps the same knowledge base, and `GET /session/files` returns `{"files": [{"source", "chunks"}]}`
+so the sidebar list is restored. The cookie is signed with `SESSION_SECRET`; a forged or edited
+cookie is ignored. API clients without a cookie can still send `X-Session-Id` (it takes
+precedence); with neither they share the `default` session, as before.
+
+### `POST /api/stream`
+
+Same request, headers and session filtering as `/api`, but the answer arrives as Server-Sent
+Events (`text/event-stream`) while it is being generated: `token` events (`{"text": "..."}`),
+then `sources` (`{"sources": [...]}`) and `done`. A failure after streaming has started is sent
+as an `error` event (`{"detail": "..."}`). The web UI uses this endpoint and falls back to `/api`
+if it is unavailable.
+
+> **Deployment note:** on AWS Lambda behind Mangum the response body is buffered, so tokens
+> arrive together rather than one by one. True streaming there needs Lambda Web Adapter with
+> `AWS_LWA_INVOKE_MODE=RESPONSE_STREAM` and a Function URL in `RESPONSE_STREAM` mode.
 
 **Example — PowerShell**
 
@@ -263,6 +290,7 @@ All configuration is read from `.env`:
 | `GOOGLE_API_KEY` | yes | Authenticates requests to the Gemini API. |
 | `GEMINI_MODEL` | yes | Gemini model code, e.g. one listed on ai.google.dev/gemini-api/docs/models. |
 | `LLM_TIMEOUT_SECONDS` | yes | Timeout for each Gemini call. |
+| `SESSION_SECRET` | yes on Lambda, recommended locally | Random string (e.g. `python -c "import secrets;print(secrets.token_hex(32))"`) used to sign the session cookie. Without it locally a new secret is made on every start, so sessions reset on restart. Changing it logs everyone out of their files. |
 | `COHERE_API_KEY` | yes | Authenticates embedding and re-ranking requests. |
 | `QDRANT_URL` | yes | URL of the Qdrant cluster. |
 | `QDRANT_API_KEY` | yes | Authenticates requests to Qdrant Cloud. |

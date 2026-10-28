@@ -144,9 +144,9 @@ The system shall be built to current industry practice. Each standard below is a
 
 The following fall short of Articles V and VIII today. They shall be corrected one at a time, on instruction, and not bundled into unrelated work.
 
-1. Endpoints are unauthenticated and the session identifier is client-chosen.
+1. Endpoints are unauthenticated. Browsers get a server-issued signed session cookie, but an `X-Session-Id` header (API clients) is still accepted and client-chosen, and cookie-less callers share a `default` session.
 2. No rate limiting; upload size is not uniformly bounded.
-3. No relevance cutoff and no source citations in answers.
+3. Retrieval has no relevance cutoff before generation; source citations use a fixed rerank-score threshold that has not been tuned against an evaluation set.
 4. The test suite covers the endpoints with external services faked, but there is no automated evaluation of retrieval or generation, and the grounding and prompt-injection guard tests (Article VIII §5) await such an evaluation set.
 5. The self-healing wrapper retries on any exception and can mask real faults.
 6. The shared upload registry is not safe under concurrent instances.
