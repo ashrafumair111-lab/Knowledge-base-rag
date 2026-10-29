@@ -1,6 +1,10 @@
 import hashlib
+import hmac
 import json
+import logging
 import os
+import re
+import secrets
 import threading
 import uuid
 from pathlib import Path
@@ -9,10 +13,12 @@ import cohere
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from langchain_cohere import CohereEmbeddings
-from langchain_groq import ChatGroq
+from langchain_core.exceptions import ModelRateLimitError
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from mangum import Mangum
@@ -22,6 +28,8 @@ from qdrant_client import QdrantClient, models
 from starlette.requests import Request
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")  # uvicorn ke saath wahi console/log
 
 COLLECTION_NAME = "grocery store"
 
@@ -53,10 +61,28 @@ PDF_NAMESPACE = uuid.UUID("a06eab4d-f20e-48c3-af71-b62597a0dc5b")
 # Cohere client - reranking (query ke against chunks ko dobara score karne) ke liye
 cohere_client = cohere.Client(api_key=os.environ["COHERE_API_KEY"])
 
-# Answer generate karne wala LLM (Groq)
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0,
+# --- Session cookie ---------------------------------------------------------
+# Server har browser ko ek signed, HttpOnly cookie deta hai -> refresh/restart par wahi session
+# milta hai aur uploaded files wapas dikhti hain. Cookie stateless hai (HMAC), isliye Lambda ke
+# kisi bhi container par verify ho jati hai. Secret sirf env me rehta hai (Art. IV section 1).
+SESSION_COOKIE = "kb_sid"
+SESSION_MAX_AGE = 14 * 24 * 3600  # seconds; har page load par naya 14 din (sliding)
+
+# Lambda par SESSION_SECRET zaroori hai (warna har container alag secret banata aur sessions toot te).
+# Local dev me na ho to process-level random secret chalta hai - restart par naya session.
+_session_secret = (
+    os.environ["SESSION_SECRET"] if ON_LAMBDA else os.environ.get("SESSION_SECRET") or secrets.token_hex(32)
+).encode()
+
+# Rerank score (0-1) se kam wale chunks ko "source" nahi gina jaata - weak match citation nahi banta
+SOURCE_MIN_SCORE = 0.3
+
+# Answer generate karne wala LLM (Gemini) - GOOGLE_API_KEY env se uthata hai.
+# Model + timeout env se aate hain (Google models retire hote rehte hain, hardcode nahi).
+# temperature set nahi - Gemini 3+ docs explicit temperature ko discourage karte hain.
+llm = ChatGoogleGenerativeAI(
+    model=os.environ["GEMINI_MODEL"],
+    timeout=float(os.environ["LLM_TIMEOUT_SECONDS"]),
     max_retries=2,
 )
 
@@ -239,6 +265,11 @@ def ingest_file(path: Path, file_hash: str, sid: str) -> dict:
         [text], metadatas=[{"source": source, "session_id": sid}]
     )
 
+    # Chunk ka number metadata me - file viewer passages ko padhne ke order me dikhata hai.
+    # (id text se banti hai, isliye ye number ids ko nahi badalta.)
+    for index, doc in enumerate(docs):
+        doc.metadata["chunk"] = index
+
     # Deterministic ids -> re-upload upsert ban jata hai.
     # session_id id me hai, warna do tabs ki same file ek hi point par collide karegi.
     ids = [
@@ -298,13 +329,29 @@ class UploadS3Request(BaseModel):
     key: str
 
 
-def session_id(x_session_id: str | None = Header(default=None, alias="X-Session-Id")) -> str:
-    """Har page load ka apna session id.
+def sign_sid(sid: str) -> str:
+    return f"{sid}.{hmac.new(_session_secret, sid.encode(), hashlib.sha256).hexdigest()[:32]}"
 
-    Frontend har load (refresh / naya tab) par naya UUID bhejta hai, isliye purane
-    tab ke uploads naye tab ko dikhte nahi - har visitor ka knowledge base alag rehta hai.
+
+def verify_sid(value: str | None) -> str | None:
+    """Cookie value se session id nikalo; signature galat ho to None (client id chun nahi sakta)."""
+    sid, _, _ = (value or "").partition(".")
+    if sid and hmac.compare_digest(sign_sid(sid), value):
+        return sid
+    return None
+
+
+def session_id(
+    request: Request,
+    x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
+) -> str:
+    """Request ka session id: explicit X-Session-Id header (API clients), warna signed cookie.
+
+    Browser cookie se chalta hai, isliye refresh par uploads wahin rehte hain aur har visitor ka
+    knowledge base alag rehta hai. Dono na ho (curl) to purana shared "default" session.
     """
-    return (x_session_id or "default").strip()[:64] or "default"
+    sid = x_session_id or getattr(request.state, "sid", None)
+    return (sid or "default").strip()[:64] or "default"
 
 
 def ingest_bytes(filename: str, data: bytes, sid: str) -> dict:
@@ -331,10 +378,109 @@ async def no_cache_static(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def session_cookie(request: Request, call_next):
+    """Browser ko signed session cookie do/refresh karo; API clients (header ya bina cookie) ko nahi."""
+    path = request.url.path
+    sid = verify_sid(request.cookies.get(SESSION_COOKIE))
+    is_browser = path == "/" or "sec-fetch-mode" in request.headers  # curl ye header nahi bhejta
+    issue = not path.startswith("/static") and not request.headers.get("x-session-id") and (
+        path == "/" or (sid is None and is_browser)
+    )
+    if issue and sid is None:
+        sid = uuid.uuid4().hex
+    request.state.sid = sid
+    response = await call_next(request)
+    if issue:
+        response.set_cookie(
+            SESSION_COOKIE,
+            sign_sid(sid),
+            max_age=SESSION_MAX_AGE,
+            httponly=True,  # JS (XSS) cookie padh nahi sakti
+            samesite="lax",
+            secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https",
+        )
+    return response
+
+
 @app.get("/")
 def home(request: Request):
     """Simple chat UI (Jinja2 template)."""
     return templates.TemplateResponse(request, "index.html")
+
+
+MAX_SCROLL_PAGES = 200  # 256 chunks/page -> ~51k chunks per session, uske baad band
+
+
+def list_session_files(sid: str) -> list[dict]:
+    """Is session ki files + har file ke chunks (sirf source field padhi jati hai, text/vectors nahi)."""
+    session_filter = models.Filter(
+        must=[models.FieldCondition(key="metadata.session_id", match=models.MatchValue(value=sid))]
+    )
+    counts: dict[str, int] = {}
+    offset = None
+    for _ in range(MAX_SCROLL_PAGES):
+        records, offset = with_heal(
+            lambda: qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=session_filter,
+                limit=256,
+                offset=offset,
+                with_payload=models.PayloadSelectorInclude(include=["metadata.source"]),
+                with_vectors=False,
+            )
+        )
+        for record in records:
+            source = (record.payload or {}).get("metadata", {}).get("source")
+            if source:
+                counts[source] = counts.get(source, 0) + 1
+        if offset is None:
+            break
+    return [{"source": name, "chunks": counts[name]} for name in sorted(counts)]
+
+
+@app.get("/session/files")
+def session_files(sid: str = Depends(session_id)) -> dict:
+    """Refresh ke baad sidebar list wapas banane ke liye.
+
+    "session" = sid ka hash (sid khud nahi): browser isse chat history ki localStorage key banata hai.
+    """
+    chat_key = hashlib.sha256(f"chat::{sid}".encode()).hexdigest()[:16]
+    return {"files": list_session_files(sid), "session": chat_key}
+
+
+@app.get("/session/passages")
+def session_passages(source: str, sid: str = Depends(session_id)) -> dict:
+    """Is session ki ek file ke passages (viewer ke liye), padhne ke order me."""
+    file_filter = models.Filter(
+        must=[
+            models.FieldCondition(key="metadata.session_id", match=models.MatchValue(value=sid)),
+            models.FieldCondition(key="metadata.source", match=models.MatchValue(value=source)),
+        ]
+    )
+    rows: list[tuple[int, str]] = []
+    offset = None
+    for _ in range(MAX_SCROLL_PAGES):
+        records, offset = with_heal(
+            lambda: qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=file_filter,
+                limit=256,
+                offset=offset,
+                with_payload=models.PayloadSelectorInclude(include=["page_content", "metadata.chunk"]),
+                with_vectors=False,
+            )
+        )
+        for record in records:
+            payload = record.payload or {}
+            # purane chunks (chunk number ke bina) end me, apne aap ke order me
+            rows.append((payload.get("metadata", {}).get("chunk", 10**9), payload.get("page_content", "")))
+        if offset is None:
+            break
+    if not rows:
+        raise HTTPException(status_code=404, detail="That file is not in this session")
+    rows.sort(key=lambda row: row[0])
+    return {"source": source, "passages": [{"n": n, "text": text} for n, (_, text) in enumerate(rows, 1)]}
 
 
 @app.post("/upload")
@@ -403,12 +549,13 @@ def history_note(history: list | None) -> str:
     return "Recent conversation (use it to resolve follow-ups like 'explain it'): " + " | ".join(lines) + " "
 
 
-@app.post("/api")
-def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
+def retrieve(body: AskRequest, sid: str) -> tuple[list[dict], list[str]]:
+    """Search + rerank (sirf is session ke chunks) -> (LLM messages, citation sources)."""
     question = body.input
 
     # --- STEP 1: DENSE search - SIRF isi session ke chunks ---
     dense_docs = find_docs(question, sid)
+    sources: list[str] = []
 
     if dense_docs:
         # --- STEP 2: RERANKING - results ko query ke against dobara score karo ---
@@ -421,6 +568,12 @@ def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
         top_docs = [dense_docs[result.index] for result in rerank_result.results]
         context = "\n".join(doc.page_content for doc in top_docs)
 
+        # Jawab ke "From <file>" chips: sirf relevant chunks ki files, duplicate nahi
+        for result, doc in zip(rerank_result.results, top_docs):
+            source = doc.metadata.get("source")
+            if source and getattr(result, "relevance_score", 0.0) >= SOURCE_MIN_SCORE and source not in sources:
+                sources.append(str(source))
+
         # "Maine kya upload kiya?" ka jawab isi list se milta hai - alag router ki zaroorat nahi
         files = sorted({str(doc.metadata.get("source")) for doc in dense_docs if doc.metadata.get("source")})
         file_note = "Files uploaded in this session: " + ", ".join(files) + ". "
@@ -429,28 +582,92 @@ def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
         context = "(no document context available)"
         file_note = "No files have been uploaded in this session yet. "
 
-    response = llm.invoke(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "You are a friendly AI chat assistant with a knowledge base of the user's "
-                    f"uploaded files. {file_note}RULES: "
-                    "- If the question is about those files, answer from the context below and "
-                    "ground your answer in it. "
-                    "- Otherwise answer normally from your own knowledge - general facts, "
-                    "chit-chat, greetings, coding, advice, anything. "
-                    "- Never refuse or say you can't answer just because the answer isn't in the context. "
-                    '- Only for questions specifically about the uploaded files where the context '
-                    'has no answer, say: "I don\'t know from uploaded PDF." '
-                    f"{history_note(body.history)}Context:\n{context}"
-                ),
-            },
-            {"role": "user", "content": question},
-        ]
-    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a friendly AI chat assistant with a knowledge base of the user's "
+                f"uploaded files. {file_note}RULES: "
+                "- If the question is about those files, answer from the context below and "
+                "ground your answer in it. "
+                "- Otherwise answer normally from your own knowledge - general facts, "
+                "chit-chat, greetings, coding, advice, anything. "
+                "- Never refuse or say you can't answer just because the answer isn't in the context. "
+                "- Always write your answer in English, formatted as Markdown (short paragraphs, "
+                "lists and **bold** where they help readability). "
+                '- Only for questions specifically about the uploaded files where the context '
+                'has no answer, say: "I don\'t know from uploaded PDF." '
+                f"{history_note(body.history)}Context:\n{context}"
+            ),
+        },
+        {"role": "user", "content": question},
+    ]
+    return messages, sources
 
-    return {"content": response.content}
+
+@app.post("/api")
+def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
+    messages, sources = retrieve(body, sid)
+    try:
+        response = llm.invoke(messages)
+    except ModelRateLimitError as exc:
+        logger.warning("LLM quota/rate limit hit: %s", str(exc)[:200])
+        raise HTTPException(status_code=429, detail=quota_detail(exc)) from exc
+
+    # .text -> Gemini 3 content blocks (thinking/text) me se sirf answer text deta hai
+    return {"content": response.text, "sources": sources}
+
+
+def quota_detail(exc: Exception) -> str:
+    """429 se user ko saaf wajah + intezaar ka waqt (Google 'Please retry in 10h6m19s' bhejta hai)."""
+    wait = re.search(r"retry in ((?:\d+h)?(?:\d+m)?)", str(exc))
+    parts = re.findall(r"\d+[hm]", wait.group(1)) if wait else []
+    when = f" in about {' '.join(parts)}" if parts else " later"
+    return f"The AI model's request quota is used up for now. Please try again{when}."
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/api/stream")
+def ask_stream(body: AskRequest, sid: str = Depends(session_id)) -> StreamingResponse:
+    # Retrieval pehle (normal HTTP errors yahin se), phir sirf LLM tokens stream hote hain
+    messages, sources = retrieve(body, sid)
+
+    def events():
+        sent = False
+        try:
+            for chunk in llm.stream(messages):
+                if chunk.text:  # .text = sirf answer text, thinking blocks nahi
+                    sent = True
+                    yield sse("token", {"text": chunk.text})
+        except ModelRateLimitError as exc:
+            # Quota/rate limit: dobara try karna bekar hai - saaf wajah batao
+            logger.warning("LLM quota/rate limit hit: %s", str(exc)[:200])
+            yield sse("error", {"detail": quota_detail(exc)})
+            return
+        except Exception as exc:
+            logger.exception("LLM stream failed (after %s text)", "some" if sent else "no")
+            if sent:  # aadha jawab ja chuka - dobara bhejne se text dohra jayega
+                yield sse("error", {"detail": "Answer generation failed. Please try again."})
+                return
+            # Kuch bhi nahi gaya: transient Gemini error (overload/rate limit). invoke() ke apne
+            # retries hain - ek baar normal tareeqe se poora jawab try karo.
+            try:
+                yield sse("token", {"text": llm.invoke(messages).text})
+            except Exception:
+                logger.exception("LLM fallback invoke failed")
+                yield sse("error", {"detail": "Answer generation failed. Please try again."})
+                return
+        yield sse("sources", {"sources": sources})
+        yield sse("done", {})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # AWS Lambda entry point - Mangum Lambda event ko FastAPI request banata hai
