@@ -56,14 +56,14 @@ def test_history_note_empty_returns_empty_string():
     assert main.history_note(None) == ""
 
 
-# --- Gemini migration -------------------------------------------------------
+# --- LLM configuration (Groq) ------------------------------------------------
 
 def test_llm_model_and_timeout_come_from_env():
-    assert main.llm.model.endswith("test-model")
-    assert main.llm.timeout == 5.0
+    assert main.llm.model_name == main.GROQ_MODEL
+    assert main.llm.request_timeout == 5.0
 
 
-@pytest.mark.parametrize("name", ["GEMINI_MODEL", "LLM_TIMEOUT_SECONDS", "COHERE_API_KEY"])
+@pytest.mark.parametrize("name", ["COHERE_API_KEY", "QDRANT_URL", "QDRANT_API_KEY"])
 def test_app_refuses_to_start_without_required_setting(monkeypatch, name):
     with monkeypatch.context() as m:
         m.delenv(name)
@@ -74,7 +74,7 @@ def test_app_refuses_to_start_without_required_setting(monkeypatch, name):
     importlib.reload(main)  # restore a healthy module for the other tests
 
 
-def test_api_returns_only_answer_text_not_thinking_blocks(app_env):
+def test_api_returns_the_model_answer(app_env):
     _, client = app_env
     resp = client.post("/api", json={"input": "hello"})
     assert resp.status_code == 200
@@ -90,7 +90,7 @@ def test_api_without_documents_skips_rerank(app_env):
 
 def test_api_llm_failure_is_not_swallowed(app_env):
     m, client = app_env
-    m.llm.invoke = lambda messages: (_ for _ in ()).throw(RuntimeError("gemini down"))
+    m.llm.invoke = lambda messages: (_ for _ in ()).throw(RuntimeError("groq down"))
     with pytest.raises(RuntimeError):
         client.post("/api", json={"input": "hello"})
 
@@ -225,7 +225,7 @@ def test_api_drops_sources_below_relevance_cutoff(app_env):
 
 # --- streaming --------------------------------------------------------------
 
-def test_stream_sends_text_tokens_in_order_without_thinking(app_env):
+def test_stream_sends_text_tokens_in_order(app_env):
     _, client = app_env
     resp = client.post("/api/stream", json={"input": "hello"})
     assert resp.status_code == 200
@@ -262,7 +262,7 @@ def test_stream_llm_failure_mid_stream_becomes_error_event(app_env):
 
     def broken(messages):
         yield AIMessageChunk(content="par")
-        raise RuntimeError("gemini down")
+        raise RuntimeError("groq down")
 
     m.llm.stream = broken
     events = sse_events(client.post("/api/stream", json={"input": "q"}))
@@ -525,7 +525,7 @@ def test_stream_failure_is_logged_with_its_real_cause(app_env, caplog):
 
 # --- model quota (429) --------------------------------------------------------
 
-QUOTA = "429 RESOURCE_EXHAUSTED. Generate content requests per day limit exceeded. Please retry in 10h6m19.2s."
+QUOTA = "429 Rate limit reached for model `openai/gpt-oss-120b` on requests per day. Please try again in 18.5s."
 
 
 def quota_error():
@@ -547,7 +547,7 @@ def test_stream_quota_error_tells_the_user_and_does_not_retry(app_env):
     events = sse_events(client.post("/api/stream", json={"input": "q"}))
     assert [e for e, _ in events] == ["error"]
     detail = events[0][1]["detail"]
-    assert "quota" in detail.lower() and "10h 6m" in detail
+    assert "quota" in detail.lower() and "18.5s" in detail
     assert calls == []  # retrying a spent quota only wastes requests
 
 
