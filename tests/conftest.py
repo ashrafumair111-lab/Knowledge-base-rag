@@ -4,8 +4,7 @@ import os
 # (load_dotenv does not override variables that are already set).
 for key, value in {
     "COHERE_API_KEY": "test",
-    "GOOGLE_API_KEY": "test",
-    "GEMINI_MODEL": "test-model",
+    "GROQ_API_KEY": "test",
     "LLM_TIMEOUT_SECONDS": "5",
     "QDRANT_URL": "http://localhost:6333",
     "QDRANT_API_KEY": "test",
@@ -23,26 +22,19 @@ import main
 
 
 class FakeLLM:
-    """Stands in for Gemini: records the prompt and answers with Gemini-3-shaped blocks."""
+    """Stands in for Groq: records the prompt and answers with plain text."""
 
     def __init__(self):
         self.calls = []
 
     def invoke(self, messages):
         self.calls.append(messages)
-        return AIMessage(
-            content=[
-                {"type": "thinking", "thinking": "private reasoning"},
-                {"type": "text", "text": "fake answer"},
-            ]
-        )
-
+        return AIMessage(content="fake answer")
 
     def stream(self, messages):
         self.calls.append(messages)
-        yield AIMessageChunk(content=[{"type": "thinking", "thinking": "private reasoning"}])
-        yield AIMessageChunk(content=[{"type": "text", "text": "fake "}])
-        yield AIMessageChunk(content=[{"type": "text", "text": "answer"}])
+        yield AIMessageChunk(content="fake ")
+        yield AIMessageChunk(content="answer")
 
 
 @pytest.fixture

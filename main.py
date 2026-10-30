@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from langchain_cohere import CohereEmbeddings
 from langchain_core.exceptions import ModelRateLimitError
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from mangum import Mangum
@@ -77,13 +77,14 @@ _session_secret = (
 # Rerank score (0-1) se kam wale chunks ko "source" nahi gina jaata - weak match citation nahi banta
 SOURCE_MIN_SCORE = 0.3
 
-# Answer generate karne wala LLM (Gemini) - GOOGLE_API_KEY env se uthata hai.
-# Model + timeout env se aate hain (Google models retire hote rehte hain, hardcode nahi).
-# temperature set nahi - Gemini 3+ docs explicit temperature ko discourage karte hain.
-llm = ChatGoogleGenerativeAI(
-    model=os.environ["GEMINI_MODEL"],
-    timeout=float(os.environ["LLM_TIMEOUT_SECONDS"]),
+# Answer generate karne wala LLM (Groq) - GROQ_API_KEY env se uthata hai.
+# Model production wala hi hai; timeout env se aata hai (default 60s).
+GROQ_MODEL = "openai/gpt-oss-120b"
+llm = ChatGroq(
+    model=GROQ_MODEL,
+    temperature=0,
     max_retries=2,
+    timeout=float(os.environ.get("LLM_TIMEOUT_SECONDS", "60")),
 )
 
 # Embeddings - semantic/meaning-based search ke liye (1024 dims)
@@ -614,14 +615,19 @@ def ask_grok(body: AskRequest, sid: str = Depends(session_id)) -> dict:
         logger.warning("LLM quota/rate limit hit: %s", str(exc)[:200])
         raise HTTPException(status_code=429, detail=quota_detail(exc)) from exc
 
-    # .text -> Gemini 3 content blocks (thinking/text) me se sirf answer text deta hai
+    # .text -> sirf jawab ka text (Groq plain string bhejta hai, Gemini 3 blocks bhejta tha)
     return {"content": response.text, "sources": sources}
 
 
 def quota_detail(exc: Exception) -> str:
-    """429 se user ko saaf wajah + intezaar ka waqt (Google 'Please retry in 10h6m19s' bhejta hai)."""
-    wait = re.search(r"retry in ((?:\d+h)?(?:\d+m)?)", str(exc))
-    parts = re.findall(r"\d+[hm]", wait.group(1)) if wait else []
+    """429 se user ko saaf wajah + intezaar ka waqt.
+
+    Groq: "Please try again in 18.5s". Gemini: "... retry in 10h6m19.2s".
+    """
+    wait = re.search(
+        r"(?:retry|try again) in ((?:\d+(?:\.\d+)?h)?(?:\d+(?:\.\d+)?m)?(?:\d+(?:\.\d+)?s)?)", str(exc)
+    )
+    parts = re.findall(r"\d+(?:\.\d+)?[hms]", wait.group(1)) if wait else []
     when = f" in about {' '.join(parts)}" if parts else " later"
     return f"The AI model's request quota is used up for now. Please try again{when}."
 
@@ -639,7 +645,7 @@ def ask_stream(body: AskRequest, sid: str = Depends(session_id)) -> StreamingRes
         sent = False
         try:
             for chunk in llm.stream(messages):
-                if chunk.text:  # .text = sirf answer text, thinking blocks nahi
+                if chunk.text:  # .text = sirf answer text
                     sent = True
                     yield sse("token", {"text": chunk.text})
         except ModelRateLimitError as exc:
@@ -652,7 +658,7 @@ def ask_stream(body: AskRequest, sid: str = Depends(session_id)) -> StreamingRes
             if sent:  # aadha jawab ja chuka - dobara bhejne se text dohra jayega
                 yield sse("error", {"detail": "Answer generation failed. Please try again."})
                 return
-            # Kuch bhi nahi gaya: transient Gemini error (overload/rate limit). invoke() ke apne
+            # Kuch bhi nahi gaya: transient LLM error (overload/rate limit). invoke() ke apne
             # retries hain - ek baar normal tareeqe se poora jawab try karo.
             try:
                 yield sse("token", {"text": llm.invoke(messages).text})
