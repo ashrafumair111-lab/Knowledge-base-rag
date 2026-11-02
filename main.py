@@ -129,6 +129,7 @@ def _pace(batch_chars: int) -> None:
     tokens = batch_chars / CHARS_PER_TOKEN
     time.sleep(tokens / EMBED_TOKENS_PER_MINUTE * 60)
 
+
 # Upload registry lock - ek hi container me do uploads race na karein
 registry_lock = threading.Lock()
 
