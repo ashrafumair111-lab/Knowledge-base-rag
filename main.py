@@ -321,10 +321,14 @@ def ingest_file(path: Path, file_hash: str, sid: str) -> dict:
         for start in range(0, len(docs), EMBED_BATCH_SIZE):
             batch_docs = docs[start : start + EMBED_BATCH_SIZE]
             batch_ids = ids[start : start + EMBED_BATCH_SIZE]
+            batch_chars = sum(len(doc.page_content) for doc in batch_docs)
+            logger.info(
+                "embed %s: batch %d-%d/%d", source, start + 1, start + len(batch_docs), len(docs)
+            )
             vector_store.add_documents(batch_docs, ids=batch_ids)
             # aakhri batch ke baad wait ki zaroorat nahi
             if start + EMBED_BATCH_SIZE < len(docs):
-                _pace(sum(len(doc.page_content) for doc in batch_docs))
+                _pace(batch_chars)
 
     with_heal(write_chunks)
 
