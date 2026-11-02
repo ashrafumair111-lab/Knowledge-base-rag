@@ -159,6 +159,45 @@ def test_changed_reupload_overwrites(app_env):
     assert upload(client, "a.txt", b"changed").json()["status"] == "overwritten"
 
 
+# --- embedding pacing (Cohere tokens/minute limit) --------------------------
+
+def test_large_upload_is_split_into_paced_batches(app_env, monkeypatch):
+    m, client = app_env
+    waits = []
+    monkeypatch.setattr(m, "_pace", waits.append)
+
+    upload(client, "a.txt", ("para one. " * 3000).encode())
+
+    calls = m.vector_store.add_documents.call_args_list
+    assert len(calls) == 2
+    assert all(len(call.args[0]) <= m.EMBED_BATCH_SIZE for call in calls)
+    # har batch ke ids usi batch ke docs ke saath jate hain
+    assert [len(call.kwargs["ids"]) for call in calls] == [len(call.args[0]) for call in calls]
+    # wait sirf batches ke BEECH - aakhri batch ke baad nahi
+    assert len(waits) == 1
+    assert waits[0] > 0
+
+
+def test_small_upload_does_not_wait(app_env, monkeypatch):
+    m, client = app_env
+    waits = []
+    monkeypatch.setattr(m, "_pace", waits.append)
+
+    upload(client, "a.txt", b"hello world")
+
+    assert m.vector_store.add_documents.call_count == 1
+    assert waits == []
+
+
+def test_pace_sleeps_for_batch_tokens(monkeypatch):
+    slept = []
+    monkeypatch.setattr(main.time, "sleep", slept.append)
+
+    main._pace(8000)  # 8000 chars ~ 2000 tokens -> 2000/80000 min = 1.5s
+
+    assert slept == [pytest.approx(1.5)]
+
+
 # --- bad input --------------------------------------------------------------
 
 def test_upload_empty_file_rejected(app_env):
