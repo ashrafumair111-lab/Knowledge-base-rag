@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -112,6 +113,21 @@ splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=200,
 )
+
+# --- Embedding pacing -------------------------------------------------------
+# Cohere ki limit "tokens per minute" hai (trial: 100k), requests per minute nahi.
+# Isliye bara document ek hi dafa bhejne se 429 aata hai aur upload fail ho jata hai.
+# Chunks chote batches me bhejte hain aur har batch ke baad tokens ke hisaab se
+# wait karte hain, taake minute budget cross na ho.
+EMBED_BATCH_SIZE = 32
+EMBED_TOKENS_PER_MINUTE = 80_000  # limit (100k) se neeche - safety margin
+CHARS_PER_TOKEN = 4  # English text ka mota-moti estimate
+
+
+def _pace(batch_chars: int) -> None:
+    """Batch ke tokens ke hisaab se wait karo (tokens/minute budget ke andar rehne ke liye)."""
+    tokens = batch_chars / CHARS_PER_TOKEN
+    time.sleep(tokens / EMBED_TOKENS_PER_MINUTE * 60)
 
 # Upload registry lock - ek hi container me do uploads race na karein
 registry_lock = threading.Lock()
@@ -299,7 +315,15 @@ def ingest_file(path: Path, file_hash: str, sid: str) -> dict:
             ),
         )
         # --- phir fresh chunks daalo (ids dene se ye upsert ban jata hai) ---
-        vector_store.add_documents(docs, ids=ids)
+        # Batch + pacing: poora document ek hi call me bhejne se Cohere ka
+        # tokens/minute limit cross ho jata hai. Chote batches ke beech wait karte hain.
+        for start in range(0, len(docs), EMBED_BATCH_SIZE):
+            batch_docs = docs[start : start + EMBED_BATCH_SIZE]
+            batch_ids = ids[start : start + EMBED_BATCH_SIZE]
+            vector_store.add_documents(batch_docs, ids=batch_ids)
+            # aakhri batch ke baad wait ki zaroorat nahi
+            if start + EMBED_BATCH_SIZE < len(docs):
+                _pace(sum(len(doc.page_content) for doc in batch_docs))
 
     with_heal(write_chunks)
 
