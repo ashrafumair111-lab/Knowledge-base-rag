@@ -16,7 +16,7 @@ ingested.json
 *.log
 
 # Not needed inside the image
-knowledge.pdf
+*.pdf
 README.md
 pyproject.toml
 uv.lock
