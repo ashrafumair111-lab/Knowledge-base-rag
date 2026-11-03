@@ -1,5 +1,7 @@
 # Knowledge Base RAG
 
+[![CI](https://github.com/ashrafumair111-lab/Knowledge-base-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/ashrafumair111-lab/Knowledge-base-rag/actions/workflows/ci.yml)
+
 A question-answering service that answers questions **strictly from an uploaded PDF document**
 using Retrieval-Augmented Generation (RAG).
 
@@ -18,6 +20,7 @@ The pipeline is identical, with one deliberate simplification:
 - [Requirements](#requirements)
 - [Setup](#setup)
 - [How to run](#how-to-run)
+- [Tests](#tests)
 - [API reference](#api-reference)
 - [Project structure](#project-structure)
 - [Configuration](#configuration)
@@ -165,6 +168,24 @@ of `npm run dev` (`nodemon index.js`) in the Node.js version.
 ### Stopping the server
 
 Press `CTRL+C` in the terminal.
+
+---
+
+## Tests
+
+The suite runs fully offline. `tests/conftest.py` sets dummy credentials before importing
+`main`, and Qdrant, Cohere, Groq and the LLM are mocked, so no real key or service is needed.
+
+```powershell
+uv run pytest -q
+```
+
+- `tests/test_main.py` — API, session isolation, ingestion, streaming (no browser)
+- `tests/test_ui.py` — Playwright browser tests against a real uvicorn instance
+
+GitHub Actions runs the same command on every pull request and on every push to `main`
+(see `.github/workflows/ci.yml`). Browser tests need Chromium, which CI installs with
+`playwright install --with-deps chromium`.
 
 ---
 
