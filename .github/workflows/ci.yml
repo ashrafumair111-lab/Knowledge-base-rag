@@ -1,6 +1,7 @@
 name: CI
 
-# Sirf CI - koi deploy nahi. PR par aur main par push hone par tests chalte hain.
+# PR aur main push par tests. Deploy sirf main par, tests pass hone ke baad,
+# aur production environment ki manual approval ke baad.
 on:
   push:
     branches: [main]
@@ -38,3 +39,72 @@ jobs:
       # is liye koi secret ya real service ki zaroorat nahi.
       - name: Run tests
         run: uv run pytest -q
+
+  deploy:
+    name: Deploy to Lambda
+    needs: test
+    # Sirf main par merge hone ke baad - PR par kabhi nahi.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # production environment par required reviewer set hai -> job yahan ruk kar
+    # approval ka intezaar karti hai.
+    environment:
+      name: production
+      url: https://lgjnjhihcqignv7rh4467iuhv40nldvp.lambda-url.eu-north-1.on.aws/
+    env:
+      AWS_REGION: eu-north-1
+      ECR_REPO: 915507704699.dkr.ecr.eu-north-1.amazonaws.com/ragchatbot
+      FUNCTION_NAME: ragchatbot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Lambda image linux/amd64 chahiye. Provenance attestation off hai warna
+      # ECR par extra manifest layer banti hai jo Lambda ko pasand nahi.
+      - name: Build and push image
+        run: |
+          docker build --platform linux/amd64 --provenance=false \
+            -t "$ECR_REPO:sha-$GITHUB_SHA" -t "$ECR_REPO:latest" .
+          docker push "$ECR_REPO:sha-$GITHUB_SHA"
+          docker push "$ECR_REPO:latest"
+
+      # Agar pehle koi update chal raha ho to update-function-code fail karta hai.
+      - name: Wait for Lambda to be ready
+        run: aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$AWS_REGION"
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --image-uri "$ECR_REPO:sha-$GITHUB_SHA" \
+            --region "$AWS_REGION"
+
+      - name: Wait for deployment
+        run: aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$AWS_REGION"
+
+      - name: Smoke test
+        run: |
+          URL=$(aws lambda get-function-url-config --function-name "$FUNCTION_NAME" \
+            --region "$AWS_REGION" --query FunctionUrl --output text)
+          echo "Function URL: $URL"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            if [ "$CODE" = "200" ]; then
+              echo "Smoke test passed: HTTP $CODE"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $CODE, retrying..."
+            sleep 5
+          done
+          echo "Smoke test failed: HTTP $CODE"
+          exit 1
