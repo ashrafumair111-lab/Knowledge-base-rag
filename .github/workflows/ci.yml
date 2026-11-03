@@ -1,0 +1,40 @@
+name: CI
+
+# Sirf CI - koi deploy nahi. PR par aur main par push hone par tests chalte hain.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Ek hi branch par purana run cancel ho jaye (naye commit ka wait na ho)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      # conftest.py khud fake env set karta hai (COHERE_*, GROQ_*, QDRANT_*),
+      # is liye koi secret ya real service ki zaroorat nahi.
+      - name: Run tests
+        run: uv run pytest -q
