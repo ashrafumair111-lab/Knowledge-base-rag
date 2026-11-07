@@ -235,7 +235,7 @@ Answers a question using the ingested PDF as the only source of truth.
 ```
 
 `sources` lists the files behind the answer: re-ranked chunks scoring at least `SOURCE_MIN_SCORE`
-(in `main.py`), de-duplicated. It is empty when no file was relevant.
+(`src/config.py`), de-duplicated. It is empty when no file was relevant.
 
 ### Sessions and `GET /session/files`
 
@@ -291,12 +291,25 @@ knowledge base rag/
 ├── .python-version      # pins Python 3.12
 ├── knowledge.pdf        # sample document (upload more via the UI)
 ├── ingested.json        # runtime registry: filename -> sha256 + chunk count
-├── main.py              # the entire application
+├── main.py              # Lambda entrypoint (Mangum + uvicorn)
 ├── pyproject.toml       # dependency declarations
-├── static/              # CSS + JS for the web UI
-├── templates/           # Jinja2 template (index.html)
 ├── uploads/             # files uploaded through the UI (runtime)
 ├── uv.lock              # locked dependency versions
+├── src/
+│   ├── app.py           # FastAPI assembly: middleware, static mount, routers
+│   ├── config.py        # env vars, paths and tunable constants
+│   ├── clients.py       # Cohere + Groq clients
+│   ├── templating.py    # Jinja2 environment
+│   ├── routes/          # URL wiring only (pages, files, upload, chat)
+│   ├── controllers/     # request/response handling
+│   ├── services/        # RAG logic: ingest, embed pacing, retrieval, answers
+│   ├── models/          # pydantic request schemas
+│   ├── middleware/      # session cookie + static cache headers
+│   ├── auth/            # signed session cookie helpers
+│   ├── db/              # Qdrant, S3 and ingestion registry
+│   ├── utils/           # filename, hashing and chunking helpers
+│   ├── assets/          # CSS + JS for the web UI
+│   └── views/           # Jinja2 template (index.html)
 └── README.md
 ```
 
@@ -315,11 +328,11 @@ All configuration is read from `.env`:
 | `QDRANT_URL` | yes | URL of the Qdrant cluster. |
 | `QDRANT_API_KEY` | yes | Authenticates requests to Qdrant Cloud. |
 
-The tunable values are currently hard-coded in `main.py`:
+The tunable values are currently hard-coded in `src/config.py`:
 
 | Setting | Value | Where |
 |---|---|---|
-| Chunk size / overlap | 1000 / 200 | `ingest_file()` |
+| Chunk size / overlap | 1000 / 200 | `src/utils/text.py` |
 | Candidate chunks retrieved | 20 | `similarity_search(..., k=20)` |
 | Chunks passed to the LLM | 5 | `rerank(..., top_n=5)` |
 | Collection name | `grocery store` | `COLLECTION_NAME` |
