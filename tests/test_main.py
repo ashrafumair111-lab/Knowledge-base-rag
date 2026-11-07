@@ -8,7 +8,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, AIMessageChunk
 
-import main
+import src.clients as clients
+import src.config as config
+import src.services.answer_service as answer_service
+import src.services.embedder as embedder
+import src.utils.files as files
 
 
 def upload(client, name, data, sid="s1"):
@@ -36,42 +40,46 @@ def with_docs(m, scores=(0.9,), sources=("a.txt",)):
 # --- unit: pure logic -------------------------------------------------------
 
 def test_safe_filename_strips_path_traversal():
-    assert main.safe_filename("../../etc/notes.txt") == "notes.txt"
+    assert files.safe_filename("../../etc/notes.txt") == "notes.txt"
 
 
 def test_safe_filename_rejects_unsupported_type():
     with pytest.raises(HTTPException) as exc:
-        main.safe_filename("virus.exe")
+        files.safe_filename("virus.exe")
     assert exc.value.status_code == 400
 
 
 def test_history_note_ignores_malformed_and_bounds_length():
     history = [{"role": "user", "content": "x" * 1000}, {"role": "system", "content": "hack"}, "junk"]
-    note = main.history_note(history)
+    note = answer_service.history_note(history)
     assert "hack" not in note
     assert "x" * 401 not in note
 
 
 def test_history_note_empty_returns_empty_string():
-    assert main.history_note(None) == ""
+    assert answer_service.history_note(None) == ""
 
 
 # --- LLM configuration (Groq) ------------------------------------------------
 
 def test_llm_model_and_timeout_come_from_env():
-    assert main.llm.model_name == main.GROQ_MODEL
-    assert main.llm.request_timeout == 5.0
+    assert clients.llm.model_name == config.GROQ_MODEL
+    assert clients.llm.request_timeout == 5.0
 
 
 @pytest.mark.parametrize("name", ["COHERE_API_KEY", "QDRANT_URL", "QDRANT_API_KEY"])
 def test_app_refuses_to_start_without_required_setting(monkeypatch, name):
+    import src.db.qdrant as qdrant_db
+
     with monkeypatch.context() as m:
         m.delenv(name)
-        # main.py calls load_dotenv(); without this it would re-read the real .env
-        m.setattr("dotenv.load_dotenv", lambda *a, **k: False)
         with pytest.raises(KeyError):
-            importlib.reload(main)
-    importlib.reload(main)  # restore a healthy module for the other tests
+            # COHERE_API_KEY -> clients import par, QDRANT_* -> qdrant import par
+            importlib.reload(clients)
+            importlib.reload(qdrant_db)
+    # restore healthy modules for the other tests
+    importlib.reload(clients)
+    importlib.reload(qdrant_db)
 
 
 def test_api_returns_the_model_answer(app_env):
@@ -164,7 +172,7 @@ def test_changed_reupload_overwrites(app_env):
 def test_large_upload_is_split_into_paced_batches(app_env, monkeypatch):
     m, client = app_env
     waits = []
-    monkeypatch.setattr(m, "_pace", waits.append)
+    monkeypatch.setattr(embedder, "_pace", waits.append)
 
     upload(client, "a.txt", ("para one. " * 3000).encode())
 
@@ -181,7 +189,7 @@ def test_large_upload_is_split_into_paced_batches(app_env, monkeypatch):
 def test_small_upload_does_not_wait(app_env, monkeypatch):
     m, client = app_env
     waits = []
-    monkeypatch.setattr(m, "_pace", waits.append)
+    monkeypatch.setattr(embedder, "_pace", waits.append)
 
     upload(client, "a.txt", b"hello world")
 
@@ -191,9 +199,9 @@ def test_small_upload_does_not_wait(app_env, monkeypatch):
 
 def test_pace_sleeps_for_batch_tokens(monkeypatch):
     slept = []
-    monkeypatch.setattr(main.time, "sleep", slept.append)
+    monkeypatch.setattr(embedder.time, "sleep", slept.append)
 
-    main._pace(8000)  # 8000 chars ~ 2000 tokens -> 2000/80000 min = 1.5s
+    embedder._pace(8000)  # 8000 chars ~ 2000 tokens -> 2000/80000 min = 1.5s
 
     assert slept == [pytest.approx(1.5)]
 
