@@ -1,6 +1,6 @@
 import os
 
-# Dummy env set BEFORE main is imported, so tests never reach real services
+# Dummy env set BEFORE the app is imported, so tests never reach real services
 # (load_dotenv does not override variables that are already set).
 for key, value in {
     "COHERE_API_KEY": "test",
@@ -12,13 +12,19 @@ for key, value in {
 }.items():
     os.environ[key] = value
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
 from fastapi.testclient import TestClient
 
-import main
+import src.clients as clients
+import src.config as config
+import src.db.qdrant as qdrant_db
+import src.services.answer_service as answer_service
+import src.utils.files as files
+from src.app import app
 
 
 class FakeLLM:
@@ -39,18 +45,39 @@ class FakeLLM:
 
 @pytest.fixture
 def app_env(monkeypatch, tmp_path):
-    """main with every external service faked and data dirs in a temp folder."""
+    """App with every external service faked and data dirs in a temp folder."""
     qdrant = MagicMock()
     qdrant.count.return_value.count = 0
     qdrant.scroll.return_value = ([], None)  # no files in the session
-    monkeypatch.setattr(main, "qdrant", qdrant)
-    monkeypatch.setattr(main, "vector_store", MagicMock())
-    monkeypatch.setattr(main, "cohere_client", MagicMock())
-    monkeypatch.setattr(main, "llm", FakeLLM())
-    monkeypatch.setattr(main, "_collection_ready", True)
-    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(main, "REGISTRY_PATH", tmp_path / "ingested.json")
-    return main, TestClient(main.app)
+    vector_store = MagicMock()
+    cohere_client = MagicMock()
+    llm = FakeLLM()
+
+    # Patch where the name is USED (module globals), not the import site:
+    # every consumer reads them through `src.db.qdrant` / `src.clients`.
+    monkeypatch.setattr(qdrant_db, "qdrant", qdrant)
+    monkeypatch.setattr(qdrant_db, "vector_store", vector_store)
+    monkeypatch.setattr(qdrant_db, "_collection_ready", True)
+    monkeypatch.setattr(clients, "cohere_client", cohere_client)
+    monkeypatch.setattr(clients, "llm", llm)
+    monkeypatch.setattr(config, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(config, "REGISTRY_PATH", tmp_path / "ingested.json")
+
+    # Handy handle for tests: m.vector_store, m.llm, m.qdrant, ...
+    handle = SimpleNamespace(
+        app=app,
+        qdrant=qdrant,
+        vector_store=vector_store,
+        cohere_client=cohere_client,
+        llm=llm,
+        UPLOAD_DIR=config.UPLOAD_DIR,
+        REGISTRY_PATH=config.REGISTRY_PATH,
+        with_heal=qdrant_db.with_heal,
+        safe_filename=files.safe_filename,
+        history_note=answer_service.history_note,
+        EMBED_BATCH_SIZE=config.EMBED_BATCH_SIZE,
+    )
+    return handle, TestClient(app)
 
 
 @pytest.fixture
@@ -67,7 +94,7 @@ def live_url(app_env):
     port = sock.getsockname()[1]
     sock.close()
 
-    server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     while not server.started:
