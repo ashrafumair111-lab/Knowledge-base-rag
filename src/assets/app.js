@@ -28,6 +28,44 @@ const viewerMeta = document.getElementById("viewer-meta");
 const viewerBody = document.getElementById("viewer-body");
 const emptyStateTemplate = chat.querySelector(".empty-state").cloneNode(true);
 
+// ---------- theme (light / dark) ----------
+
+const themeToggle = document.getElementById("theme-toggle");
+const THEME_KEY = "kb-theme";
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  const dark = theme === "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  themeToggle.setAttribute("aria-pressed", String(dark));
+  const label = dark ? "Switch to light mode" : "Switch to dark mode";
+  themeToggle.setAttribute("aria-label", label);
+  themeToggle.title = label;
+}
+
+applyTheme(currentTheme()); // head script ne paint se pehle theme laga di thi
+
+themeToggle.addEventListener("click", () => {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch (err) {}
+  applyTheme(next);
+});
+
+// Jab tak user khud choose na kare, OS ki setting follow karo.
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  try {
+    if (localStorage.getItem(THEME_KEY)) return; // user ki choice jeetati hai
+  } catch (err) {
+    return;
+  }
+  applyTheme(e.matches ? "dark" : "light");
+});
+
 // Session ab server ka signed HttpOnly cookie (kb_sid) hai - same-origin fetch use khud bhejta hai.
 // Refresh par wahi session milta hai, isliye uploaded files wapas aati hain (restoreFiles).
 

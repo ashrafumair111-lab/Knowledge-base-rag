@@ -713,3 +713,21 @@ def test_chat_keeps_only_the_most_recent_messages(app):
     app.reload()
     expect(app.locator(".bubble.user")).to_have_count(20)  # 40 messages = 20 Q/A pairs
     expect(app.locator(".bubble.user").last).to_have_text("q24")
+
+
+# --- theme toggle -----------------------------------------------------------
+
+def test_theme_toggle_switches_and_remembers_the_choice(app):
+    expect(app.locator("html")).to_have_attribute("data-theme", "light")
+    toggle = app.locator("#theme-toggle")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+
+    toggle.click()
+    expect(app.locator("html")).to_have_attribute("data-theme", "dark")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+
+    app.reload()
+    expect(app.locator("html")).to_have_attribute("data-theme", "dark")  # choice saved
+
+    app.locator("#theme-toggle").click()
+    expect(app.locator("html")).to_have_attribute("data-theme", "light")
