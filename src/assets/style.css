@@ -10,13 +10,17 @@
 }
 
 :root {
+  color-scheme: light;
   --ground: #eef1f0;
   --sheet: #ffffff;
   --text: #1a211e;
   --muted: #5f6563;
+  --soft-text: #41504c;
   --hair: #d7dad9;
   --hair-strong: #cbcfcd;
   --hair-soft: #e6e9e8;
+  --scrim: rgba(26, 33, 30, 0.4);
+  --shadow-deep: 0 20px 60px rgba(26, 33, 30, 0.25);
 
   --mint-50: #f3fbf9;
   --mint-100: #e0f8f3;
@@ -44,6 +48,45 @@
 
   --font: "Inter", system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
   --side-w: 304px;
+}
+
+/* Dark theme: same variables, dark values (sab components khud follow karte hain). */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground: #14181a;
+  --sheet: #1c2124;
+  --text: #e8ecea;
+  --muted: #9aa3a0;
+  --soft-text: #c3ccc8;
+  --hair: #2c3336;
+  --hair-strong: #3a4246;
+  --hair-soft: #252b2e;
+  --scrim: rgba(0, 0, 0, 0.6);
+  --shadow-deep: 0 20px 60px rgba(0, 0, 0, 0.55);
+
+  --mint-50: #0f1a18;
+  --mint-100: #12211e;
+  --mint-200: #1b302b;
+  --mint-300: #23413a;
+  --mint-400: #2c534a;
+  --mint-line: #3c6a60;
+  --mint-ink: #c7f0e7;
+
+  --sky: #0f2030;
+  --sky-ink: #bfe6fb;
+  --peach: #2b1f12;
+  --peach-ink: #ffd7ae;
+  --rose: #2c1519;
+  --rose-line: #5a2a33;
+  --rose-ink: #ffc4ce;
+  --green: #12241a;
+  --green-ink: #b8e8c6;
+  --yellow: #2a2412;
+  --yellow-line: #5a4d1c;
+  --yellow-deep: #3a3114;
+  --yellow-ink: #ffe9a3;
+  --amber: #e0a53a;
+  --online: #4cc38a;
 }
 
 html,
@@ -471,6 +514,30 @@ button.file-row:hover {
   display: none;
 }
 
+.sheet-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* Theme toggle: light mode me moon (dark par jao), dark mode me sun (light par jao). */
+.theme-toggle:active {
+  transform: scale(0.94);
+}
+
+.theme-toggle .icon-sun {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-sun {
+  display: block;
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-moon {
+  display: none;
+}
+
 .sheet-head h1 {
   font-size: 24px;
   font-weight: 600;
@@ -524,7 +591,7 @@ button.file-row:hover {
   gap: 12px;
   font-size: 15px;
   line-height: 1.65;
-  color: #41504c;
+  color: var(--soft-text);
 }
 
 .empty-icon {
@@ -895,7 +962,7 @@ button.file-row:hover {
   background: var(--sheet);
   border: none;
   border-radius: 20px;
-  box-shadow: 0 20px 60px rgba(26, 33, 30, 0.25);
+  box-shadow: var(--shadow-deep);
 }
 
 .viewer[open] {
@@ -904,7 +971,7 @@ button.file-row:hover {
 }
 
 .viewer::backdrop {
-  background: rgba(26, 33, 30, 0.4);
+  background: var(--scrim);
 }
 
 .viewer-head {
