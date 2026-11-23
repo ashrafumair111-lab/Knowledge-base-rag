@@ -1,4 +1,4 @@
-"""Signed session cookie: browser apna session id khud chun nahi sakta."""
+"""Signed session cookie: browser apna session id khud chun nahi sakta.."""
 
 import hashlib
 import hmac
