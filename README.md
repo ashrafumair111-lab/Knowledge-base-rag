@@ -1,4 +1,4 @@
-# Knowledge Base RAG
+# Knowledge Base RAG .
 
 [![CI](https://github.com/ashrafumair111-lab/Knowledge-base-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/ashrafumair111-lab/Knowledge-base-rag/actions/workflows/ci.yml)
 
